@@ -5,8 +5,20 @@ services:
     build: .
     ports:
       - "8080:8080"
+      # Enterprise SSO (Microsoft 365) callback. The hosted-portal sign-in
+      # redirects the browser to localhost:3128. Uncomment this AND set
+      # KIRO_SSO_CALLBACK_BIND=0.0.0.0 below to complete that login from a
+      # browser on the host while the proxy runs in this container.
+      # - "3128:3128"
     volumes:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
+      # Bind host for the Enterprise SSO callback listener. Default (unset) is
+      # loopback-only (127.0.0.1/::1), reachable only from inside the container.
+      # Set to 0.0.0.0 so the published 3128 port above can reach it. The callback
+      # is transient and anti-CSRF state-matched, but this exposes it on the
+      # container network during the ~10-minute login window — only enable on a
+      # trusted network.
+      # - KIRO_SSO_CALLBACK_BIND=0.0.0.0
     restart: unless-stopped

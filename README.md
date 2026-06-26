@@ -106,12 +106,48 @@ For users in restricted network regions, configure an outbound proxy in the admi
 
 The setting takes effect immediately without restarting.
 
+## Importing Microsoft 365 / Entra ID (Azure AD) credentials
+
+Enterprise SSO (Microsoft 365 / Entra ID) accounts are neither AWS Builder ID nor
+IAM Identity Center accounts, so they are minted through the interactive browser
+sign-in helper `kiro-login-helper.py`, which writes a `CLIProxyAPI_<user>.json`
+credential file (`auth_method: external_idp`). There are three ways to load that file:
+
+1. **Paste / upload in the admin panel.** Add Account → Credentials JSON (or the
+   Enterprise SSO card's file picker) accepts the helper's native `CLIProxyAPI_*.json`
+   verbatim — snake_case keys (`token_endpoint`, `issuer_url`, `scopes`, `profile_arn`)
+   are understood.
+
+2. **API.** `POST /admin/api/auth/import-cli-json` accepts a single helper object, a
+   JSON array, a `{ "files": ["<json>", ...] }` / `{ "accounts": [...] }` wrapper, or
+   raw text with several objects. It returns per-item results.
+
+   ```bash
+   curl -X POST http://localhost:8080/admin/api/auth/import-cli-json \
+     -H "X-Admin-Password: $ADMIN_PASSWORD" \
+     --data-binary @CLIProxyAPI_user.json
+   ```
+
+3. **Zero-touch drop folder (Docker).** With `KIRO_IMPORT_WATCH=1` (set by default in
+   `docker-compose.yml`), any `CLIProxyAPI_*.json` placed in `data/imports/` is imported
+   within ~15s, then moved to `data/imports/processed/` (or `failed/` with a `.error.txt`
+   sidecar). Imports go through the same persisted path the running server owns, so they
+   never race the in-memory config.
+
+> The account email is stored as a label only. The password is **never** persisted or
+> sent upstream — Microsoft 365 tenants enforce MFA / Conditional Access, so a headless
+> password (ROPC) grant is not a reliable auth path. Use the interactive helper to mint
+> the credential, then import the JSON.
+
 ## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `KIRO_IMPORT_WATCH` | Enable the `data/imports/` auto-ingest watcher (`1`/`true`) | off (on in Docker) |
+| `KIRO_IMPORT_DIR` | Directory the watcher scans for `CLIProxyAPI_*.json` | `data/imports` |
+| `KIRO_PROFILE_REGIONS` | Comma-separated fallback regions for external_idp profile probing | `us-east-1,eu-central-1` |
 
 ## Contributing
 

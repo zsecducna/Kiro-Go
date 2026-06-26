@@ -251,6 +251,8 @@ func NewHandler() *Handler {
 	go h.backgroundStatsSaver()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
+	// Opt-in auto-ingest watcher (KIRO_IMPORT_WATCH); no-op when disabled.
+	h.startImportWatcher()
 	return h
 }
 

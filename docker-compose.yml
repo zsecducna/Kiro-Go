@@ -13,8 +13,18 @@ services:
       - "127.0.0.1:3128:3128"
     volumes:
       - ./data:/app/data
+      # Zero-touch credential drop folder. Any CLIProxyAPI_*.json minted by
+      # kiro-login-helper.py and dropped in ./data/imports is auto-imported within
+      # ~15s (then moved to ./data/imports/processed). It is a subpath of the data
+      # mount above, so no extra mount is strictly required — kept explicit for clarity.
+      - ./data/imports:/app/data/imports
     environment:
       - CONFIG_PATH=/app/data/config.json
+      # Enable the auto-ingest watcher (off by default on a bare build). Drop a
+      # CLIProxyAPI_*.json into ./data/imports and the account appears with no
+      # restart and no manual API call. Imports go through the same persisted path
+      # the live server owns, so they never race the in-memory config.
+      - KIRO_IMPORT_WATCH=1
       # Bind host for the Enterprise SSO callback listener INSIDE the container.
       # Default (unset) is loopback-only (127.0.0.1/::1), which the published port
       # above cannot reach; 0.0.0.0 lets the forwarded connection land. The callback

@@ -2467,8 +2467,51 @@
       '</div>' +
       '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
       '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
+      '</div>' +
+      // Alternative path: import a CLIProxyAPI_*.json already minted by the
+      // standalone kiro-login-helper.py (offline / headless hosts where the
+      // browser sign-in can't run on the proxy host itself).
+      '<div class="divider-text mt-4 mb-2"><span>' + escapeHtml(t('kirosso.orImportJson')) + '</span></div>' +
+      '<div class="form-group">' +
+      '<label>' + escapeHtml(t('kirosso.helperJsonLabel')) + '</label>' +
+      '<p class="help-block text-xs">' + escapeHtml(t('kirosso.helperJsonHint')) + '</p>' +
+      '<input type="file" id="kiroSsoJsonFile" accept=".json" multiple class="mt-1">' +
+      '<textarea id="kiroSsoJsonText" class="font-mono mt-2" placeholder=\'{"auth_method":"external_idp","client_id":"...","refresh_token":"...","token_endpoint":"https://login.microsoftonline.com/.../oauth2/v2.0/token","issuer_url":"...","scopes":"... offline_access"}\'></textarea>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-primary" id="kiroSsoImportJsonBtn" type="button">' + escapeHtml(t('kirosso.importJson')) + '</button>' +
+      '</div>' +
       '</div>';
     $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
+    $('kiroSsoJsonFile').addEventListener('change', e => loadHelperJsonFiles(e.target));
+    $('kiroSsoImportJsonBtn').addEventListener('click', importHelperJson);
+  }
+  // loadHelperJsonFiles reads one or more selected CLIProxyAPI_*.json files into
+  // the textarea (newline-separated objects, which normalizeCliJson handles).
+  function loadHelperJsonFiles(input) {
+    const files = Array.from(input.files || []);
+    if (files.length === 0) return;
+    Promise.all(files.map(f => f.text())).then(texts => {
+      $('kiroSsoJsonText').value = texts.map(s => s.trim()).filter(Boolean).join('\n');
+    });
+  }
+  // importHelperJson posts the helper JSON (file-loaded or pasted) to the
+  // dedicated /auth/import-cli-json endpoint, which accepts the helper's native
+  // snake_case external_idp format directly.
+  async function importHelperJson() {
+    const raw = ($('kiroSsoJsonText').value || '').trim();
+    if (!raw) { toastWarning(t('kirosso.helperJsonEmpty')); return; }
+    const res = await api('/auth/import-cli-json', { method: 'POST', body: raw });
+    const d = await res.json();
+    if (d.success) {
+      const ids = (d.imported || []).map(a => a.id);
+      closeModal(); loadAccounts(); loadStats();
+      let msg = t('sso.importSuccess', (d.imported || []).length);
+      if ((d.errors || []).length > 0) msg += t('sso.importPartial', d.errors.length);
+      toastPrimary(msg, { duration: 5200 });
+      ids.forEach(autoRefreshNewAccount);
+    } else {
+      toastError(t('common.failed') + ': ' + (d.error || ''));
+    }
   }
   async function startKiroSsoLogin() {
     // No region prompt: the data-plane region is derived from the profile ARN

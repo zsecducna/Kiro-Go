@@ -75,9 +75,9 @@ func TestNormalizeRawCredentialCamelCaseStillWorks(t *testing.T) {
 // unknown auth methods.
 func TestNormalizeAuthMethodInference(t *testing.T) {
 	cases := []struct {
-		name                                   string
-		raw, tokenEndpoint, clientID, secret   string
-		want                                   string
+		name                                 string
+		raw, tokenEndpoint, clientID, secret string
+		want                                 string
 	}{
 		{"external via tokenEndpoint+clientId", "", "https://x/token", "cid", "", "external_idp"},
 		{"idc via clientId+secret", "", "", "cid", "sec", "idc"},

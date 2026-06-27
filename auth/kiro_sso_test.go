@@ -209,3 +209,43 @@ func TestRefreshExternalIdpTokenRequiresClientAndEndpoint(t *testing.T) {
 		t.Fatalf("expected error when tokenEndpoint is empty")
 	}
 }
+
+// TestValidateExternalIdpEndpointAcceptsAllowListed verifies the exported validator
+// accepts real Azure / Microsoft 365 token endpoints (commercial, us-gov, china).
+func TestValidateExternalIdpEndpointAcceptsAllowListed(t *testing.T) {
+	for _, raw := range []string{
+		"https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+		"https://login.microsoftonline.us/tenant/v2.0",
+		"https://login.partner.microsoftonline.cn/tenant/oauth2/v2.0/token",
+	} {
+		if err := ValidateExternalIdpEndpoint(raw); err != nil {
+			t.Errorf("expected %q accepted, got %v", raw, err)
+		}
+	}
+}
+
+// TestValidateExternalIdpEndpointRejectsUnsafe verifies the validator rejects the
+// SSRF shapes a pasted credential JSON could carry: cleartext http, IP literals,
+// and non-allow-listed hosts.
+func TestValidateExternalIdpEndpointRejectsUnsafe(t *testing.T) {
+	for _, raw := range []string{
+		"http://login.microsoftonline.com/x",  // not https
+		"https://127.0.0.1/oauth/token",       // IP literal
+		"https://evil.example.com/oauth/token", // not allow-listed
+	} {
+		if err := ValidateExternalIdpEndpoint(raw); err == nil {
+			t.Errorf("expected %q rejected, got nil", raw)
+		}
+	}
+}
+
+// TestSetExternalIdpValidatorForTestSwapsAndRestores verifies the test seam lets a
+// test override (and restore) the validator so happy-path import tests can POST
+// against an httptest server (http + 127.0.0.1) that the real allow-list rejects.
+func TestSetExternalIdpValidatorForTestSwapsAndRestores(t *testing.T) {
+	restore := SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer SetExternalIdpValidatorForTest(restore)
+	if err := ValidateExternalIdpEndpoint("https://evil.example.com/x"); err != nil {
+		t.Fatalf("expected swapped no-op validator to accept, got %v", err)
+	}
+}

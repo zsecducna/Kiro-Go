@@ -533,6 +533,21 @@ func validateExternalIdpEndpoint(rawURL string) error {
 	return fmt.Errorf("external IdP host %q is not allow-listed", host)
 }
 
+// externalIdpEndpointValidator is the function ValidateExternalIdpEndpoint delegates
+// to. Tests override it via SetExternalIdpValidatorForTest so a happy-path import
+// test can POST against an httptest server (http + 127.0.0.1) that the real
+// allow-list would reject.
+var externalIdpEndpointValidator = validateExternalIdpEndpoint
+
+// ValidateExternalIdpEndpoint is the exported entry point for validating a user- or
+// discovery-supplied external IdP endpoint URL. The credential-import path
+// (package proxy) uses this to guard against SSRF / refresh-token exfiltration: a
+// pasted tokenEndpoint pointing at an internal or attacker-controlled host would
+// otherwise cause the server to POST the account's refresh token there.
+func ValidateExternalIdpEndpoint(rawURL string) error {
+	return externalIdpEndpointValidator(rawURL)
+}
+
 // oidcDiscover fetches the OpenID Connect discovery document for issuerURL and
 // returns its authorization and token endpoints. The issuer and BOTH discovered
 // endpoints are validated against the IdP host allow-list; redirects are NOT

@@ -415,9 +415,11 @@ func TestApiImportCredentialsExternalIdpDerivesEndpointsFromUserId(t *testing.T)
 
 // TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT verifies a bare
 // credential blob (clientId + accessToken + refreshToken, NO authMethod/userId/
-// tokenEndpoint) imports: the accessToken's JWT issuer classifies it as
-// external_idp and yields the tenant to derive the endpoint from. This is the
-// shape of a raw flat credential with no markers.
+// tokenEndpoint) imports via TRUST-ON-IMPORT: the accessToken's JWT issuer
+// classifies it as external_idp + yields the tenant to derive the endpoint from,
+// and — because the token is an Azure AD JWT with a real exp — the credential is
+// persisted verbatim WITHOUT a live refresh round-trip (so the same JSON can be
+// re-imported without the refresh token getting consumed/rotated).
 func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
@@ -425,6 +427,8 @@ func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) 
 	}
 	defer installCleanAuthClient(t)()
 
+	// Sentinel: if trust-on-import were broken, a refresh would hit this server and
+	// the persisted AccessToken would be "at-jwt" instead of the pasted JWT.
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"access_token":"at-jwt","refresh_token":"rt-j2","expires_in":3600}`)
@@ -434,22 +438,23 @@ func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) 
 	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
 	defer auth.SetExternalIdpValidatorForTest(restore)
 
-	// Build a fake Azure AD access token whose iss points at the fake server, so the
-	// derived token endpoint hits it. (Signature is irrelevant — we only read iss.)
+	// Bare blob: only clientId + accessToken + refreshToken. The access token is an
+	// Azure AD JWT (iss + future exp) → external_idp + derived tenant + trust-on-import
+	// (NO live refresh; pasted tokens persist verbatim, ExpiresAt from JWT exp).
 	tenant := "5fbc183e-3d09-4043-b36f-0c49d3665977"
-	iss := fake.URL + "/" + tenant + "/v2.0"
-	jwt := "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"`+iss+`"}`)) + "."
+	const exp int64 = 2000000000
+	jwt := "eyJhbGciOiJub25lIn0." +
+		base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"iss":%q,"exp":%d}`, fake.URL+"/"+tenant+"/v2.0", exp))) + "."
 
 	h := &Handler{pool: accountpool.GetPool()}
 
-	// No authMethod, no userId, no tokenEndpoint — only clientId + accessToken + refreshToken.
 	body := fmt.Sprintf(`{"clientId":"fa6d79bf-cdaa-495e-8359-78aab7c7cd9b","accessToken":%q,"refreshToken":"rt","region":"eu-central-1"}`, jwt)
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	h.apiImportCredentials(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 200 (trust-on-import), got %d body=%s", rec.Code, rec.Body.String())
 	}
 	got := config.GetAccounts()[0]
 	if got.AuthMethod != "external_idp" {
@@ -459,7 +464,13 @@ func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) 
 	if got.TokenEndpoint != wantTE {
 		t.Fatalf("derived TokenEndpoint: want %q, got %q", wantTE, got.TokenEndpoint)
 	}
-	if got.AccessToken != "at-jwt" {
-		t.Fatalf("AccessToken: want at-jwt (refreshed), got %q", got.AccessToken)
+	if got.AccessToken != jwt {
+		t.Fatalf("AccessToken: want the pasted JWT persisted verbatim (trust-on-import), got %q", got.AccessToken)
+	}
+	if got.ExpiresAt != exp {
+		t.Fatalf("ExpiresAt: want %d (from JWT exp, trust-on-import), got %d", exp, got.ExpiresAt)
+	}
+	if got.RefreshToken != "rt" {
+		t.Fatalf("RefreshToken: want the pasted token (not rotated), got %q", got.RefreshToken)
 	}
 }

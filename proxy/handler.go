@@ -3089,32 +3089,57 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 用 refreshToken 刷新获取新的 accessToken。导入必须以一次成功的刷新为前提：
-	// 本地缓存里的 accessToken 不携带可信的过期时间，盲猜短 TTL 会让账号在选号时
-	// 永远被跳过，导致后台/按需刷新都无法触发（详见 ensureValidToken 与 Pick 的过期判定）。
-	tempAccount := &config.Account{
-		RefreshToken:  req.RefreshToken,
-		ClientID:      req.ClientID,
-		ClientSecret:  req.ClientSecret,
-		AuthMethod:    req.AuthMethod,
-		Region:        req.Region,
-		TokenEndpoint: req.TokenEndpoint,
-		Scopes:        req.Scopes,
+	// Resolve the access token to persist. For external_idp we prefer TRUST-ON-IMPORT:
+	// when the pasted JSON carries an Azure AD access token (a JWT with a real exp),
+	// persist it directly WITHOUT a live refresh round-trip. The JSON can then be
+	// imported repeatedly / into multiple instances without each import consuming
+	// (rotating) the refresh token, and without requiring egress to Microsoft at
+	// import time. The runtime background refresh (backgroundRefresh /
+	// ensureValidToken) renews it later when the account is actually used. Falls
+	// back to refresh-at-import for idc/social and for external_idp credentials
+	// carrying only a refreshToken (so the regression gate — reject when refresh
+	// fails — still holds there).
+	var (
+		accessToken string
+		expiresAt   int64
+		profileArn  string
+	)
+	email := req.Email
+	if req.AuthMethod == "external_idp" && req.AccessToken != "" {
+		if exp := auth.ExpFromAccessTokenJWT(req.AccessToken); exp > 0 {
+			accessToken = req.AccessToken
+			expiresAt = exp
+			profileArn = req.ProfileArn
+		}
 	}
-	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
-	if err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
-		return
+	if accessToken == "" {
+		tempAccount := &config.Account{
+			RefreshToken:  req.RefreshToken,
+			ClientID:      req.ClientID,
+			ClientSecret:  req.ClientSecret,
+			AuthMethod:    req.AuthMethod,
+			Region:        req.Region,
+			TokenEndpoint: req.TokenEndpoint,
+			Scopes:        req.Scopes,
+		}
+		a, newRT, ea, newPA, err := auth.RefreshToken(tempAccount)
+		if err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+			return
+		}
+		accessToken = a
+		expiresAt = ea
+		profileArn = newPA
+		if newRT != "" {
+			req.RefreshToken = newRT
+		}
+		if fetchedEmail, _, _ := auth.GetUserInfo(accessToken); fetchedEmail != "" {
+			email = fetchedEmail
+		}
 	}
-	if newRefreshToken != "" {
-		req.RefreshToken = newRefreshToken
-	}
-
-	// 获取用户信息
-	email, _, _ := auth.GetUserInfo(accessToken)
-	if email == "" {
-		email = req.Email // fall back to a pasted full record's email
+	if profileArn == "" {
+		profileArn = req.ProfileArn // external_idp refresh returns no profileArn
 	}
 
 	// 创建账号
@@ -3127,10 +3152,6 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	id := req.ID
 	if id == "" || config.AccountIDExists(id) {
 		id = auth.GenerateAccountID()
-	}
-	profileArn := newProfileArn
-	if profileArn == "" {
-		profileArn = req.ProfileArn // external_idp refresh returns no profileArn
 	}
 	account := config.Account{
 		ID:            id,

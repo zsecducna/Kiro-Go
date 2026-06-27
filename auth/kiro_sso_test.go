@@ -288,3 +288,18 @@ func TestDeriveExternalIdpEndpoints(t *testing.T) {
 		t.Fatalf("userId should take precedence over accessToken, got %q", te4)
 	}
 }
+
+// TestExpFromAccessTokenJWT pins the exp extraction used for trust-on-import.
+func TestExpFromAccessTokenJWT(t *testing.T) {
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"x","exp":2000000000}`))
+	jwt := "eyJhbGciOiJub25lIn0." + payload + "."
+	if got := ExpFromAccessTokenJWT(jwt); got != 2000000000 {
+		t.Fatalf("ExpFromAccessTokenJWT: got %d, want 2000000000", got)
+	}
+	if got := ExpFromAccessTokenJWT(""); got != 0 {
+		t.Fatalf("empty → 0, got %d", got)
+	}
+	if got := ExpFromAccessTokenJWT("not-a-jwt"); got != 0 {
+		t.Fatalf("non-JWT → 0, got %d", got)
+	}
+}

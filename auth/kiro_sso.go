@@ -575,6 +575,33 @@ func issuerFromAccessTokenJWT(accessToken string) string {
 	return claims.Iss
 }
 
+// ExpFromAccessTokenJWT decodes an unverified access token's payload and returns
+// its exp claim (Unix seconds). No signature verification: this is used only to
+// set a trustworthy ExpiresAt when importing an external_idp credential WITHOUT a
+// live refresh round-trip (trust-on-import), never to authenticate the token.
+// Returns 0 if accessToken is not a JWT or has no exp.
+func ExpFromAccessTokenJWT(accessToken string) int64 {
+	raw := strings.TrimSpace(accessToken)
+	if raw == "" {
+		return 0
+	}
+	parts := strings.Split(raw, ".")
+	if len(parts) < 2 {
+		return 0
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return 0
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return 0
+	}
+	return claims.Exp
+}
+
 // DeriveExternalIdpEndpoints reconstructs the Microsoft / Azure AD token endpoint,
 // OIDC issuer, and default scopes for an external-IdP credential. The Azure tenant
 // is recovered from userId (Kiro Account Manager exports carry it at account

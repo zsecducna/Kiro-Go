@@ -138,6 +138,23 @@ credential file (`auth_method: external_idp`). There are three ways to load that
    sidecar). Imports go through the same persisted path the running server owns, so they
    never race the in-memory config.
 
+4. **Import from the Kiro IDE cache (no browser, no helper).** If the Kiro IDE is already
+   signed in on the same host as the proxy, it keeps a live credential at
+   `~/.aws/sso/cache/kiro-auth-token.json`. The admin panel's Enterprise SSO card has an
+   **Import from Kiro IDE (this host)** button, or call the API directly:
+
+   ```bash
+   curl -X POST http://localhost:8080/admin/api/auth/import-ide-cache \
+     -H "X-Admin-Password: $ADMIN_PASSWORD"
+   # custom location: -d '{"path":"/path/to/kiro-auth-token.json"}'
+   ```
+
+   The proxy reads the file **server-side**, so this works only when the IDE and the proxy
+   share a host — or, in Docker, when that file is mounted into the container and
+   `KIRO_IDE_CACHE` points at it. The cache's stale `expiresAt` is ignored: the import
+   performs a mandatory refresh, so the persisted expiry always comes from a fresh upstream
+   response.
+
 > The account email is stored as a label only. The password is **never** persisted or
 > sent upstream — Microsoft 365 tenants enforce MFA / Conditional Access, so a headless
 > password (ROPC) grant is not a reliable auth path. Use the interactive helper to mint
@@ -153,6 +170,7 @@ credential file (`auth_method: external_idp`). There are three ways to load that
 | `HOST` | HTTP bind host (overrides config; `-host` flag wins over this) | `127.0.0.1` |
 | `KIRO_IMPORT_WATCH` | Enable the `data/imports/` auto-ingest watcher (`1`/`true`) | off (on in Docker) |
 | `KIRO_IMPORT_DIR` | Directory the watcher scans for `CLIProxyAPI_*.json` | `data/imports` |
+| `KIRO_IDE_CACHE` | Path to the Kiro IDE credential cache for `import-ide-cache` | `~/.aws/sso/cache/kiro-auth-token.json` |
 | `KIRO_PROFILE_REGIONS` | Comma-separated fallback regions for external_idp profile probing | `us-east-1,eu-central-1` |
 
 ## Contributing

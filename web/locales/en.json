@@ -231,6 +231,8 @@
   "modal.enterpriseSsoDesc": "Add a Microsoft 365 / Entra ID (Azure AD) tenant account via Kiro hosted SSO",
   "kirosso.hostNote": "Open the sign-in link on this machine (the same host as the proxy). The browser is redirected through your Microsoft 365 login automatically.",
   "kirosso.openInstruction": "A browser tab was opened. Sign in with your Microsoft 365 work/school account, then return here. Tip: use a guest/incognito window to avoid a cached session.",
+  "kirosso.ideCacheNote": "Already signed into the Kiro IDE on this host? Import its cached credential directly — no browser sign-in.",
+  "kirosso.importIdeCache": "Import from Kiro IDE (this host)",
   "kirosso.orImportJson": "or import a credential JSON",
   "kirosso.helperJsonLabel": "Import CLIProxyAPI_*.json",
   "kirosso.helperJsonHint": "Use a credential file produced by kiro-login-helper.py (offline / headless hosts). Select one or more files, or paste the JSON below.",

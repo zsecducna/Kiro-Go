@@ -2450,7 +2450,12 @@
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.enterpriseSsoDesc')) + '</p>' +
       '<div id="kiroSsoStep1">' +
-      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.hostNote')) + '</p></div>' +
+      // Fastest path when the Kiro IDE is already signed in ON THIS HOST: read its
+      // local credential cache and import directly, no browser sign-in.
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.ideCacheNote')) + '</p>' +
+      '<button class="btn btn-sm btn-outline mt-2" id="kiroSsoIdeCacheBtn" type="button">' + escapeHtml(t('kirosso.importIdeCache')) + '</button>' +
+      '</div>' +
+      '<div class="message message-info mt-2"><p class="text-xs">' + escapeHtml(t('kirosso.hostNote')) + '</p></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="startKiroSsoBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
@@ -2482,8 +2487,24 @@
       '</div>' +
       '</div>';
     $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
+    $('kiroSsoIdeCacheBtn').addEventListener('click', importIdeCache);
     $('kiroSsoJsonFile').addEventListener('change', e => loadHelperJsonFiles(e.target));
     $('kiroSsoImportJsonBtn').addEventListener('click', importHelperJson);
+  }
+  // importIdeCache imports the credential the Kiro IDE already cached on the proxy
+  // host (~/.aws/sso/cache/kiro-auth-token.json) with no browser sign-in. The
+  // backend reads the file server-side, so this only works when the IDE and the
+  // proxy run on the same host (or the cache is mounted + KIRO_IDE_CACHE is set).
+  async function importIdeCache() {
+    const res = await api('/auth/import-ide-cache', { method: 'POST', body: JSON.stringify({}) });
+    const d = await res.json();
+    if (d.success) {
+      closeModal(); loadAccounts(); loadStats();
+      toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+      autoRefreshNewAccount(d.account?.id);
+    } else {
+      toastError(t('common.failed') + ': ' + (d.error || ''));
+    }
   }
   // loadHelperJsonFiles reads one or more selected CLIProxyAPI_*.json files into
   // the textarea (newline-separated objects, which normalizeCliJson handles).

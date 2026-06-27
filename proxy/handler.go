@@ -2225,6 +2225,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportCredentials(w, r)
 	case path == "/auth/import-cli-json" && r.Method == "POST":
 		h.apiImportCliJson(w, r)
+	case path == "/auth/import-ide-cache" && r.Method == "POST":
+		h.apiImportIdeCache(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -3218,6 +3220,47 @@ func (h *Handler) apiImportCliJson(w http.ResponseWriter, r *http.Request) {
 		"imported": imported,
 		"errors":   errs,
 		"warnings": warnings,
+	})
+}
+
+// apiImportIdeCache imports the credential the Kiro IDE already cached on this
+// host (~/.aws/sso/cache/kiro-auth-token.json), with no browser sign-in. The
+// optional JSON body { "path": "..." } overrides the cache location (else the
+// KIRO_IDE_CACHE env var, else the default path). It funnels through the same
+// importOne core as every other import path, so the persisted account is
+// identical to an interactive Enterprise SSO login.
+func (h *Handler) apiImportIdeCache(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path string `json:"path"`
+	}
+	// Body is optional; ignore a decode error (including an empty body).
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	path := ideCachePath(body.Path)
+	req, err := readIdeCacheCredential(path)
+	if err != nil {
+		w.WriteHeader(importErrorStatus(err))
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	account, err := h.importOne(req)
+	if err != nil {
+		w.WriteHeader(importErrorStatus(err))
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
+	logger.Infof("[Import] %s (account %s)", describeIdeCacheImport(path, account.AuthMethod), account.Email)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"source":  path,
+		"account": map[string]interface{}{
+			"id":         account.ID,
+			"email":      account.Email,
+			"authMethod": account.AuthMethod,
+		},
 	})
 }
 

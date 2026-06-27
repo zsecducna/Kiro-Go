@@ -24,6 +24,13 @@ follows [Keep a Changelog](https://keepachangelog.com/).
 - Admin panel file picker for uploading helper JSON; `app.js` credential parsing now
   maps both snake_case and camelCase.
 - `testdata/CLIProxyAPI_sample_external_idp.json` sanitized fixture.
+- **Import directly from the Kiro IDE cache (no browser, no helper script).** New
+  `POST /admin/api/auth/import-ide-cache` endpoint and an admin-panel button read the
+  credential the Kiro IDE already cached on the host
+  (`~/.aws/sso/cache/kiro-auth-token.json`, overridable via `KIRO_IDE_CACHE` or a `path`
+  body field) and import it through the same `importOne` core. The cache's camelCase keys
+  map straight onto the existing decoder; its stale `expiresAt` is ignored in favor of the
+  mandatory refresh.
 - **Configurable listen port/host.** New `-port` / `-host` CLI flags and `PORT` /
   `HOST` env overrides (precedence: flag > env > `config.json`), so the proxy can run
   on a port other than `8080` without editing the config. `docker-compose.yml` honors

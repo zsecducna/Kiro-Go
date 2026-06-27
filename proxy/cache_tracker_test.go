@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"crypto/sha256"
+	"kiro-go/config"
 	"strings"
 	"testing"
 	"time"
@@ -304,5 +305,44 @@ func TestPromptCacheCrossAccountSharing(t *testing.T) {
 	usageB := tracker.Compute("account-B", profile)
 	if usageB.CacheReadInputTokens == 0 {
 		t.Fatalf("account B: expected cache_read > 0 (cross-account sharing), got 0. usage=%+v", usageB)
+	}
+}
+
+// TestPromptCacheCapConfigurable verifies C2: the cache-read cap can be set
+// above the default 0.85 via config, so a request where 90% of input is from
+// cache reports the full 90% (not clamped to 85%).
+func TestPromptCacheCapConfigurable(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	// Build a profile: 1024 tokens cached (>= defaultMinCacheableTokens), total
+	// 1100. Default cap clamps cache_read to 0.85*1100=935; cap=0.95 allows up
+	// to 0.95*1100=1045 >= 1024, so the full breakpoint is reported.
+	hasher := sha256.New()
+	writeHashChunk(hasher, canonicalizeCacheValue(map[string]interface{}{"k": strings.Repeat("v ", 500)}))
+	var fp [32]byte
+	copy(fp[:], hasher.Sum(nil))
+	profile := &promptCacheProfile{
+		Breakpoints:      []promptCacheBreakpoint{{Fingerprint: fp, CumulativeTokens: 1024, TTL: 5 * time.Minute}},
+		TotalInputTokens: 1100,
+		Model:            "claude-sonnet-4-5",
+	}
+	tracker := newPromptCacheTracker(5 * time.Minute)
+	tracker.Update("acc", profile) // store it
+
+	// Default cap 0.85: cache_read clamped to min(1000, 0.85*1100=935) = 935.
+	usage85 := tracker.Compute("acc", profile)
+	if usage85.CacheReadInputTokens > 940 {
+		t.Fatalf("default cap: expected cache_read ~935, got %d", usage85.CacheReadInputTokens)
+	}
+
+	// Raise cap to 0.95: cache_read should be min(1000, 0.95*1100=1045) = 1000.
+	config.UpdatePromptCacheMaxRatio(0.95)
+	defer config.UpdatePromptCacheMaxRatio(0.85)
+	usage95 := tracker.Compute("acc", profile)
+	if usage95.CacheReadInputTokens < 990 {
+		t.Fatalf("cap 0.95: expected cache_read ~1000, got %d", usage95.CacheReadInputTokens)
 	}
 }

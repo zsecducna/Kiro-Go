@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"kiro-go/config"
 	"sort"
 	"strconv"
 	"strings"
@@ -157,7 +158,7 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	// Cap cacheable tokens at 85% of total input to ensure a realistic
 	// uncached portion. The newest content in a request is never fully
 	// served from cache on the current turn.
-	maxCacheable := int(float64(profile.TotalInputTokens) * 0.85)
+	maxCacheable := int(float64(profile.TotalInputTokens) * config.GetPromptCacheMaxRatio())
 	if lastTokens > maxCacheable {
 		lastTokens = maxCacheable
 	}

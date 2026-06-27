@@ -211,6 +211,11 @@ type Config struct {
 	// Can be overridden by the LOG_LEVEL environment variable.
 	LogLevel string `json:"logLevel,omitempty"`
 
+	// PromptCacheMaxRatio caps the fraction of input tokens reported as cache_read
+	// in a single turn. Default 0.85. Raise to 0.95 for "continue"-heavy workloads
+	// where the newest content is minimal and >85% of input is genuinely from cache.
+	PromptCacheMaxRatio float64 `json:"promptCacheMaxRatio,omitempty"`
+
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
 	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
@@ -870,6 +875,24 @@ func GetLogLevel() string {
 		return "info"
 	}
 	return cfg.LogLevel
+}
+
+// GetPromptCacheMaxRatio returns the cache-read cap ratio (0.0-1.0). Defaults to 0.85.
+func GetPromptCacheMaxRatio() float64 {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.PromptCacheMaxRatio <= 0 || cfg.PromptCacheMaxRatio > 1 {
+		return 0.85
+	}
+	return cfg.PromptCacheMaxRatio
+}
+
+// UpdatePromptCacheMaxRatio sets the cache-read cap ratio and persists the change.
+func UpdatePromptCacheMaxRatio(ratio float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PromptCacheMaxRatio = ratio
+	return Save()
 }
 
 // UpdateLogLevel updates the log level setting and persists the change.

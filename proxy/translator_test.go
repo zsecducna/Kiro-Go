@@ -554,12 +554,14 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected one image extracted, got %d", len(cur.Images))
 	}
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
-		t.Fatalf("expected one tool result")
+	// The tool result is an orphan (no preceding assistant tool call), so per
+	// the flatten rule it must be narrated into Content rather than kept
+	// structured — and its text must survive even though an image is attached.
+	if !strings.Contains(cur.Content, "here is the screenshot") {
+		t.Fatalf("expected orphan tool-result text narrated into content, got %q", cur.Content)
 	}
-	gotText := cur.UserInputMessageContext.ToolResults[0].Content[0].Text
-	if gotText != "here is the screenshot" {
-		t.Fatalf("expected original tool text preserved, got %q", gotText)
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) != 0 {
+		t.Fatalf("expected orphan tool result to be flattened into text, not kept structured")
 	}
 }
 
@@ -624,10 +626,13 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 
 	payload := OpenAIToKiro(req, false)
 
+	// The tool image is carried on the history entry that holds the (now
+	// narrated) tool result. Flatten strips the structured ToolResults from
+	// that entry, so count the image on the user entry itself, not via the
+	// structured context.
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil &&
-			len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+		if h.UserInputMessage != nil {
 			toolHistImages += len(h.UserInputMessage.Images)
 		}
 	}

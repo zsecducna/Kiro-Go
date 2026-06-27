@@ -4,7 +4,9 @@ services:
   kiro-go:
     build: .
     ports:
-      - "8080:8080"
+      # Host port is overridable: `KIRO_PORT=9090 docker compose up -d` publishes
+      # 9090 on the host. The container always listens on 8080 internally.
+      - "${KIRO_PORT:-8080}:8080"
       # Enterprise SSO (Microsoft 365) callback. The hosted-portal sign-in
       # redirects the browser to localhost:3128, so the operator must run that
       # browser ON THE DOCKER HOST. Publishing host-side to 127.0.0.1 only keeps

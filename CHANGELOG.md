@@ -24,6 +24,10 @@ follows [Keep a Changelog](https://keepachangelog.com/).
 - Admin panel file picker for uploading helper JSON; `app.js` credential parsing now
   maps both snake_case and camelCase.
 - `testdata/CLIProxyAPI_sample_external_idp.json` sanitized fixture.
+- **Configurable listen port/host.** New `-port` / `-host` CLI flags and `PORT` /
+  `HOST` env overrides (precedence: flag > env > `config.json`), so the proxy can run
+  on a port other than `8080` without editing the config. `docker-compose.yml` honors
+  `KIRO_PORT` for the published host port (`KIRO_PORT=9090 docker compose up -d`).
 
 ### Fixed
 - `external_idp` imports previously returned `400 "external IdP refresh requires

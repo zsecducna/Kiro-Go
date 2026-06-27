@@ -49,6 +49,10 @@ git clone https://github.com/Quorinex/Kiro-Go.git
 cd Kiro-Go
 go build -o kiro-go .
 ./kiro-go
+
+# Run on a different port (flag > PORT env > config.json):
+./kiro-go -port 9090
+# or: PORT=9090 ./kiro-go
 ```
 
 ### Deploy on Zeabur
@@ -145,6 +149,8 @@ credential file (`auth_method: external_idp`). There are three ways to load that
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `PORT` | HTTP listen port (overrides config; `-port` flag wins over this) | `8080` |
+| `HOST` | HTTP bind host (overrides config; `-host` flag wins over this) | `127.0.0.1` |
 | `KIRO_IMPORT_WATCH` | Enable the `data/imports/` auto-ingest watcher (`1`/`true`) | off (on in Docker) |
 | `KIRO_IMPORT_DIR` | Directory the watcher scans for `CLIProxyAPI_*.json` | `data/imports` |
 | `KIRO_PROFILE_REGIONS` | Comma-separated fallback regions for external_idp profile probing | `us-east-1,eu-central-1` |

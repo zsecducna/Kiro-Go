@@ -321,3 +321,45 @@ func TestApiImportCredentialsExternalIdpRejectsWhenRefreshFails(t *testing.T) {
 		t.Fatalf("expected no account persisted, got %d", len(accs))
 	}
 }
+
+// TestApiImportCredentialsExternalIdpPreservesFullRecordIdentity verifies that when
+// a full account record (with id/email/profileArn) is pasted, those are preserved
+// rather than regenerated, so re-importing a backup does not duplicate accounts.
+func TestApiImportCredentialsExternalIdpPreservesFullRecordIdentity(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	defer installCleanAuthClient(t)()
+
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"access_token":"at-ext","refresh_token":"rt-rotated","expires_in":3600}`)
+	}))
+	defer fake.Close()
+
+	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer auth.SetExternalIdpValidatorForTest(restore)
+
+	h := &Handler{pool: accountpool.GetPool()}
+
+	const providedID = "11111111-2222-3333-4444-555555555555"
+	body := fmt.Sprintf(`{"id":%q,"email":"ada@example.com","profileArn":"arn:aws:codewhisperer:eu-central-1:1:profile/PRESERVED","authMethod":"external_idp","refreshToken":"rt","clientId":"c","tokenEndpoint":%q,"region":"eu-central-1"}`, providedID, fake.URL)
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	got := config.GetAccounts()[0]
+	if got.ID != providedID {
+		t.Fatalf("ID: want reused %q, got %q", providedID, got.ID)
+	}
+	if got.Email != "ada@example.com" {
+		t.Fatalf("Email: want ada@example.com (GetUserInfo empty in test → fallback), got %q", got.Email)
+	}
+	if got.ProfileArn != "arn:aws:codewhisperer:eu-central-1:1:profile/PRESERVED" {
+		t.Fatalf("ProfileArn: want preserved, got %q", got.ProfileArn)
+	}
+}

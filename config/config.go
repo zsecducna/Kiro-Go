@@ -413,6 +413,23 @@ func GetAccounts() []Account {
 	return accounts
 }
 
+// AccountIDExists reports whether an account with the given ID is already stored.
+// Used by the credential-import path to reuse a pasted record's id when it does
+// not collide, so re-importing a backup never creates a duplicate entry.
+func AccountIDExists(id string) bool {
+	if id == "" {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, a := range cfg.Accounts {
+		if a.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func GetEnabledAccounts() []Account {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()

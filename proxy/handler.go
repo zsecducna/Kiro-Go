@@ -3089,14 +3089,27 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 
 	// 获取用户信息
 	email, _, _ := auth.GetUserInfo(accessToken)
+	if email == "" {
+		email = req.Email // fall back to a pasted full record's email
+	}
 
 	// 创建账号
 	provider := req.Provider
 	if provider == "" && req.AuthMethod == "external_idp" {
 		provider = "AzureAD"
 	}
+	// Reuse a pasted record's id when it does not collide; otherwise mint a fresh
+	// one so re-importing a backup never creates a duplicate entry.
+	id := req.ID
+	if id == "" || config.AccountIDExists(id) {
+		id = auth.GenerateAccountID()
+	}
+	profileArn := newProfileArn
+	if profileArn == "" {
+		profileArn = req.ProfileArn // external_idp refresh returns no profileArn
+	}
 	account := config.Account{
-		ID:            auth.GenerateAccountID(),
+		ID:            id,
 		Email:         email,
 		AccessToken:   accessToken,
 		RefreshToken:  req.RefreshToken,
@@ -3108,7 +3121,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:     expiresAt,
 		Enabled:       true,
 		MachineId:     config.GenerateMachineId(),
-		ProfileArn:    newProfileArn,
+		ProfileArn:    profileArn,
 		TokenEndpoint: req.TokenEndpoint,
 		IssuerURL:     req.IssuerURL,
 		Scopes:        req.Scopes,

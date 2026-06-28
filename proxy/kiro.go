@@ -288,6 +288,18 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	return result
 }
 
+// upstreamError builds a classifiable error from a non-200 Kiro response.
+// 402 is tagged "overage" so the failover layer routes it to overage handling
+// (disableAccountOverage → refresh OverageStatus) instead of falling through to
+// the generic RecordError path. All other codes produce "HTTP <code> ...", which
+// pool.IsAuthFailure reads via its digit-boundary status-token matcher.
+func upstreamError(statusCode int, endpoint, body string) error {
+	if statusCode == 402 {
+		return fmt.Errorf("HTTP 402 overage from %s: %s", endpoint, body)
+	}
+	return fmt.Errorf("HTTP %d from %s: %s", statusCode, endpoint, body)
+}
+
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	originalProfileArn := ""
@@ -384,8 +396,10 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-			// Authentication errors and payment errors are not retried across endpoints.
+			lastErr = upstreamError(resp.StatusCode, ep.Name, string(errBody))
+			// Auth failures (401/403) and overage (402) are account-level: do not
+			// retry across endpoints. Other status codes fall through to the next
+			// endpoint.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr
 			}

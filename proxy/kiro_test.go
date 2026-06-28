@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"kiro-go/config"
+	"kiro-go/pool"
 	"net/http"
 	"net/url"
 	"testing"
@@ -268,4 +269,31 @@ func awsEventStreamFrame(t *testing.T, eventType string, payload map[string]inte
 	frame = append(frame, payloadBytes...)
 	frame = append(frame, 0, 0, 0, 0)
 	return frame
+}
+
+// TestCallKiroAPIClassifiesByStatusCode verifies the error CallKiroAPI builds
+// from a non-200 upstream response classifies correctly downstream: 401/403 →
+// auth failure (digit-boundary safe), 402 → overage (NOT auth), and a
+// suspension marker in the body → suspension. CallKiroAPI delegates error
+// construction to upstreamError.
+func TestCallKiroAPIClassifiesByStatusCode(t *testing.T) {
+	// 401 / 403 → auth failure, even when the body carries unrelated digits.
+	if !pool.IsAuthFailure(upstreamError(401, "primary", "request req_999 failed")) {
+		t.Fatal("401 should classify as auth failure")
+	}
+	if !pool.IsAuthFailure(upstreamError(403, "primary", "unrelated body")) {
+		t.Fatal("403 should classify as auth failure")
+	}
+	// 402 → overage, NOT auth.
+	e402 := upstreamError(402, "primary", "Usage limit exceeded")
+	if pool.IsAuthFailure(e402) {
+		t.Fatal("402 must NOT classify as auth failure")
+	}
+	if !isOverageErrorMessage(e402.Error()) {
+		t.Fatal("402 should classify as overage")
+	}
+	// Suspension signalled in the body of a 403 still classifies as suspension.
+	if !pool.IsSuspensionError(upstreamError(403, "primary", "TEMPORARILY_SUSPENDED")) {
+		t.Fatal("suspension body should classify as suspension")
+	}
 }

@@ -50,7 +50,8 @@ func readIdeCacheCredential(path string) (importCredentialRequest, error) {
 		if os.IsNotExist(err) {
 			return importCredentialRequest{}, &importValidationError{
 				"Kiro IDE cache not found at " + path + " — sign in once with the Kiro IDE, " +
-					"or set KIRO_IDE_CACHE to the credential file path",
+					"or set KIRO_IDE_CACHE to the credential file path. In Docker, mount the host " +
+					"AWS SSO cache directory with KIRO_AWS_SSO_CACHE_DIR.",
 			}
 		}
 		return importCredentialRequest{}, &importValidationError{

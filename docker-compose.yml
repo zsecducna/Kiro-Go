@@ -20,11 +20,13 @@ services:
       - ./data/imports:/app/data/imports
       # Let the Dockerized app import the Kiro IDE credential cached on the host.
       # The app runs as root in the container, so its default ~/.aws path would be
-      # /root/.aws/...; mount the host user's IDE cache explicitly instead.
-      - ${KIRO_IDE_CACHE_HOST:-/home/harry-riddle/.aws/sso/cache/kiro-auth-token.json}:/app/kiro-auth-token.json:ro
+      # /root/.aws/...; mount the host user's AWS SSO cache directory explicitly.
+      # Directory mount is portable across Linux/macOS and lets the container start
+      # even when the cache file has not been created yet.
+      - ${KIRO_AWS_SSO_CACHE_DIR:-${HOME}/.aws/sso/cache}:/host-aws-sso-cache:ro
     environment:
       - CONFIG_PATH=/app/data/config.json
-      - KIRO_IDE_CACHE=/app/kiro-auth-token.json
+      - KIRO_IDE_CACHE=/host-aws-sso-cache/kiro-auth-token.json
       # Force the app's in-container listen port to match the published
       # container-side port above. This prevents a stale data/config.json port
       # (for example 8081) from making `localhost:8080` unreachable.

@@ -18,8 +18,13 @@ services:
       # ~15s (then moved to ./data/imports/processed). It is a subpath of the data
       # mount above, so no extra mount is strictly required — kept explicit for clarity.
       - ./data/imports:/app/data/imports
+      # Let the Dockerized app import the Kiro IDE credential cached on the host.
+      # The app runs as root in the container, so its default ~/.aws path would be
+      # /root/.aws/...; mount the host user's IDE cache explicitly instead.
+      - ${KIRO_IDE_CACHE_HOST:-/home/harry-riddle/.aws/sso/cache/kiro-auth-token.json}:/app/kiro-auth-token.json:ro
     environment:
       - CONFIG_PATH=/app/data/config.json
+      - KIRO_IDE_CACHE=/app/kiro-auth-token.json
       # Force the app's in-container listen port to match the published
       # container-side port above. This prevents a stale data/config.json port
       # (for example 8081) from making `localhost:8080` unreachable.

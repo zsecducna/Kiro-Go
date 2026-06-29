@@ -14,6 +14,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -23,10 +24,18 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
 func main() {
+	// CLI flags. -port/-host let an operator run on a different address without
+	// editing config.json (e.g. when 8080 is already taken). Precedence is
+	// flag > env (PORT/HOST) > config.json. -1 / "" mean "not set".
+	portFlag := flag.Int("port", -1, "HTTP listen port (overrides PORT env and config.json)")
+	hostFlag := flag.String("host", "", "HTTP bind host (overrides HOST env and config.json)")
+	flag.Parse()
+
 	// 配置文件路径，支持环境变量覆盖
 	configPath := "data/config.json"
 	if envPath := os.Getenv("CONFIG_PATH"); envPath != "" {
@@ -49,6 +58,28 @@ func main() {
 	// 环境变量覆盖密码
 	if envPassword := os.Getenv("ADMIN_PASSWORD"); envPassword != "" {
 		config.SetPassword(envPassword)
+	}
+
+	// Port/host override: env first, then flag wins if provided. Persisted config
+	// is left untouched — these are runtime overrides only.
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		if p, err := strconv.Atoi(envPort); err == nil && p > 0 && p <= 65535 {
+			config.SetPort(p)
+		} else {
+			logger.Warnf("Ignoring invalid PORT env value %q", envPort)
+		}
+	}
+	if envHost := os.Getenv("HOST"); envHost != "" {
+		config.SetHost(envHost)
+	}
+	if *portFlag >= 0 {
+		if *portFlag == 0 || *portFlag > 65535 {
+			log.Fatalf("Invalid -port %d: must be 1-65535", *portFlag)
+		}
+		config.SetPort(*portFlag)
+	}
+	if *hostFlag != "" {
+		config.SetHost(*hostFlag)
 	}
 
 	// 初始化账号池

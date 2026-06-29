@@ -1,0 +1,15 @@
+{
+  "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.SAMPLE_ACCESS_TOKEN_PAYLOAD.SAMPLE_SIGNATURE",
+  "auth_method": "external_idp",
+  "client_id": "00000000-1111-2222-3333-444444444444",
+  "disabled": false,
+  "expired": "2026-06-26T06:47:20Z",
+  "issuer_url": "https://login.microsoftonline.com/00000000-aaaa-bbbb-cccc-000000000000/v2.0",
+  "profile_arn": "arn:aws:codewhisperer:us-east-1:000000000000:profile/SAMPLE0PROFILE",
+  "refresh_token": "0.SAMPLE_REFRESH_TOKEN_VALUE",
+  "region": "us-east-1",
+  "scopes": "api://00000000-1111-2222-3333-444444444444/codewhisperer:conversations api://00000000-1111-2222-3333-444444444444/codewhisperer:completions offline_access",
+  "timestamp": 1782452451474,
+  "token_endpoint": "https://login.microsoftonline.com/00000000-aaaa-bbbb-cccc-000000000000/oauth2/v2.0/token",
+  "type": "kiro"
+}

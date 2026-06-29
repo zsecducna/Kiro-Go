@@ -357,6 +357,23 @@ func SetPassword(password string) {
 	cfg.Password = password
 }
 
+// SetPort overrides the HTTP listen port in memory (does not persist). Used by
+// the -port CLI flag / PORT env override so an operator can run on a port other
+// than the configured one without editing config.json.
+func SetPort(port int) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.Port = port
+}
+
+// SetHost overrides the HTTP bind host in memory (does not persist). Used by the
+// -host CLI flag / HOST env override.
+func SetHost(host string) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.Host = host
+}
+
 // GetConfigDir returns the directory containing the config JSON file.
 // Useful for sibling state (e.g. stored Responses, caches) that should live
 // alongside the configuration file.

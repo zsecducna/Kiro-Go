@@ -49,6 +49,10 @@ git clone https://github.com/Quorinex/Kiro-Go.git
 cd Kiro-Go
 go build -o kiro-go .
 ./kiro-go
+
+# Run on a different port (flag > PORT env > config.json):
+./kiro-go -port 9090
+# or: PORT=9090 ./kiro-go
 ```
 
 ### Deploy on Zeabur
@@ -106,12 +110,71 @@ For users in restricted network regions, configure an outbound proxy in the admi
 
 The setting takes effect immediately without restarting.
 
+## Importing Microsoft 365 / Entra ID (Azure AD) credentials
+
+Enterprise SSO (Microsoft 365 / Entra ID) accounts are neither AWS Builder ID nor
+IAM Identity Center accounts, so they are minted through the interactive browser
+sign-in helper `kiro-login-helper.py`, which writes a `CLIProxyAPI_<user>.json`
+credential file (`auth_method: external_idp`). There are three ways to load that file:
+
+1. **Paste / upload in the admin panel.** Add Account → Credentials JSON (or the
+   Enterprise SSO card's file picker) accepts the helper's native `CLIProxyAPI_*.json`
+   verbatim — snake_case keys (`token_endpoint`, `issuer_url`, `scopes`, `profile_arn`)
+   are understood.
+
+2. **API.** `POST /admin/api/auth/import-cli-json` accepts a single helper object, a
+   JSON array, a `{ "files": ["<json>", ...] }` / `{ "accounts": [...] }` wrapper, or
+   raw text with several objects. It returns per-item results.
+
+   ```bash
+   curl -X POST http://localhost:8080/admin/api/auth/import-cli-json \
+     -H "X-Admin-Password: $ADMIN_PASSWORD" \
+     --data-binary @CLIProxyAPI_user.json
+   ```
+
+3. **Zero-touch drop folder (Docker).** With `KIRO_IMPORT_WATCH=1` (set by default in
+   `docker-compose.yml`), any `CLIProxyAPI_*.json` placed in `data/imports/` is imported
+   within ~15s, then moved to `data/imports/processed/` (or `failed/` with a `.error.txt`
+   sidecar). Imports go through the same persisted path the running server owns, so they
+   never race the in-memory config.
+
+4. **Import from the Kiro IDE cache (no browser, no helper).** If the Kiro IDE is already
+   signed in on the same host as the proxy, it keeps a live credential at
+   `~/.aws/sso/cache/kiro-auth-token.json`. The admin panel's Enterprise SSO card has an
+   **Import from Kiro IDE (this host)** button, or call the API directly:
+
+   ```bash
+   curl -X POST http://localhost:8080/admin/api/auth/import-ide-cache \
+     -H "X-Admin-Password: $ADMIN_PASSWORD"
+   # custom location: -d '{"path":"/path/to/kiro-auth-token.json"}'
+   ```
+
+   The proxy reads the file **server-side**, so this works only when the IDE and the proxy
+   share a host — or, in Docker, when the host AWS SSO cache directory is mounted into the
+   container. The Compose file does this portably for Linux/macOS with
+   `${HOME}/.aws/sso/cache:/host-aws-sso-cache:ro`; override `KIRO_AWS_SSO_CACHE_DIR` if
+   your Kiro IDE uses a different location. The cache's stale `expiresAt` is ignored: the
+   import performs a mandatory refresh, so the persisted expiry always comes from a fresh
+   upstream response.
+
+> The account email is stored as a label only. The password is **never** persisted or
+> sent upstream — Microsoft 365 tenants enforce MFA / Conditional Access, so a headless
+> password (ROPC) grant is not a reliable auth path. Use the interactive helper to mint
+> the credential, then import the JSON.
+
 ## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `PORT` | HTTP listen port (overrides config; `-port` flag wins over this) | `8080` |
+| `HOST` | HTTP bind host (overrides config; `-host` flag wins over this) | `127.0.0.1` |
+| `KIRO_IMPORT_WATCH` | Enable the `data/imports/` auto-ingest watcher (`1`/`true`) | off (on in Docker) |
+| `KIRO_IMPORT_DIR` | Directory the watcher scans for `CLIProxyAPI_*.json` | `data/imports` |
+| `KIRO_IDE_CACHE` | Path to the Kiro IDE credential cache for `import-ide-cache` | `~/.aws/sso/cache/kiro-auth-token.json` (Docker: `/host-aws-sso-cache/kiro-auth-token.json`) |
+| `KIRO_AWS_SSO_CACHE_DIR` | Host AWS SSO cache directory mounted by Docker Compose for IDE-cache import | `$HOME/.aws/sso/cache` |
+| `KIRO_PROFILE_REGIONS` | Comma-separated fallback regions for external_idp profile probing | `us-east-1,eu-central-1` |
 
 ## Contributing
 

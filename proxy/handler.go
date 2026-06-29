@@ -251,6 +251,8 @@ func NewHandler() *Handler {
 	go h.backgroundStatsSaver()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
+	// Opt-in auto-ingest watcher (KIRO_IMPORT_WATCH); no-op when disabled.
+	h.startImportWatcher()
 	return h
 }
 
@@ -2221,6 +2223,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
 		h.apiImportCredentials(w, r)
+	case path == "/auth/import-cli-json" && r.Method == "POST":
+		h.apiImportCliJson(w, r)
+	case path == "/auth/import-ide-cache" && r.Method == "POST":
+		h.apiImportIdeCache(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -3006,94 +3012,25 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ClientID     string `json:"clientId"`
-		ClientSecret string `json:"clientSecret"`
-		AuthMethod   string `json:"authMethod"`
-		Provider     string `json:"provider"`
-		Region       string `json:"region"`
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// decodeImportRequest accepts both the helper's native snake_case
+	// (CLIProxyAPI_*.json) and the camelCase the existing UI/API send, so a raw
+	// helper document and the legacy payload both work through one path.
+	req, err := decodeImportRequest(body)
+	if err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
 
-	if req.RefreshToken == "" {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "refreshToken is required"})
-		return
-	}
-
-	// 设置默认值
-	if req.Region == "" {
-		req.Region = "us-east-1"
-	}
-	if req.AuthMethod == "" {
-		if req.ClientID != "" {
-			req.AuthMethod = "idc"
-		} else {
-			req.AuthMethod = "social"
-		}
-	}
-	// 标准化 authMethod
-	switch strings.ToLower(req.AuthMethod) {
-	case "idc", "builderid", "enterprise":
-		req.AuthMethod = "idc"
-	case "social", "google", "github":
-		req.AuthMethod = "social"
-	default:
-		if req.ClientID != "" && req.ClientSecret != "" {
-			req.AuthMethod = "idc"
-		} else {
-			req.AuthMethod = "social"
-		}
-	}
-
-	// 用 refreshToken 刷新获取新的 accessToken。导入必须以一次成功的刷新为前提：
-	// 本地缓存里的 accessToken 不携带可信的过期时间，盲猜短 TTL 会让账号在选号时
-	// 永远被跳过，导致后台/按需刷新都无法触发（详见 ensureValidToken 与 Pick 的过期判定）。
-	tempAccount := &config.Account{
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Region:       req.Region,
-	}
-	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
+	account, err := h.importOne(req)
 	if err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
-		return
-	}
-	if newRefreshToken != "" {
-		req.RefreshToken = newRefreshToken
-	}
-
-	// 获取用户信息
-	email, _, _ := auth.GetUserInfo(accessToken)
-
-	// 创建账号
-	account := config.Account{
-		ID:           auth.GenerateAccountID(),
-		Email:        email,
-		AccessToken:  accessToken,
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Provider:     req.Provider,
-		Region:       req.Region,
-		ExpiresAt:    expiresAt,
-		Enabled:      true,
-		MachineId:    config.GenerateMachineId(),
-		ProfileArn:   newProfileArn,
-	}
-
-	if err := config.AddAccount(account); err != nil {
-		w.WriteHeader(500)
+		w.WriteHeader(importErrorStatus(err))
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
@@ -3104,6 +3041,225 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		"account": map[string]interface{}{
 			"id":    account.ID,
 			"email": account.Email,
+		},
+	})
+}
+
+// importValidationError marks an import failure caused by bad/missing input (a
+// 400) as opposed to an internal/upstream failure (a 500). importErrorStatus
+// maps it to the right HTTP status so every caller is consistent.
+type importValidationError struct{ msg string }
+
+func (e *importValidationError) Error() string { return e.msg }
+
+func importErrorStatus(err error) int {
+	// importOne returns *importValidationError directly (never wrapped) for bad
+	// input, and a plain error for internal/upstream failures.
+	if _, ok := err.(*importValidationError); ok {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
+// importOne is the single source of truth for turning a normalized credential
+// request into a persisted account. apiImportCredentials, apiImportCliJson, and
+// the directory watcher all funnel through here so the stored account is
+// identical to what apiPollKiroSso writes for an interactive login.
+//
+// The refresh-before-import invariant is intentional: a credential is only
+// persisted after one successful token refresh, because a locally-cached access
+// token carries no trustworthy expiry and guessing a short TTL makes the pool
+// skip the account forever (see ensureValidToken / Pick expiry handling).
+func (h *Handler) importOne(req importCredentialRequest) (config.Account, error) {
+	if strings.TrimSpace(req.RefreshToken) == "" {
+		return config.Account{}, &importValidationError{"refreshToken is required"}
+	}
+	if req.Region == "" {
+		req.Region = "us-east-1"
+	}
+	if req.AuthMethod == "" {
+		req.AuthMethod = normalizeAuthMethod("", req.TokenEndpoint, req.ClientID, req.ClientSecret)
+	}
+	// external_idp refreshes against the IdP token endpoint (refresh_token grant,
+	// public client). Without tokenEndpoint+clientId, refreshExternalIdpToken
+	// hard-fails with an opaque error; reject up front with an actionable message.
+	if req.AuthMethod == "external_idp" {
+		if strings.TrimSpace(req.TokenEndpoint) == "" || strings.TrimSpace(req.ClientID) == "" {
+			return config.Account{}, &importValidationError{
+				"external_idp import requires token_endpoint and client_id (mint them with kiro-login-helper.py)",
+			}
+		}
+	}
+
+	// Mandatory refresh. Carry the external_idp material so the external branch in
+	// auth.RefreshToken actually succeeds.
+	tempAccount := &config.Account{
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Region:        req.Region,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerURL:     req.IssuerURL,
+		Scopes:        req.Scopes,
+	}
+	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
+	if err != nil {
+		return config.Account{}, &importValidationError{"Token refresh failed: " + err.Error()}
+	}
+	if newRefreshToken != "" {
+		req.RefreshToken = newRefreshToken
+	}
+
+	// Email: prefer the request-supplied label; else best-effort from the token.
+	email := strings.TrimSpace(req.Email)
+	if email == "" {
+		email, _, _ = auth.GetUserInfo(accessToken)
+	}
+
+	account := config.Account{
+		ID:            auth.GenerateAccountID(),
+		Email:         email,
+		Nickname:      req.Nickname,
+		AccessToken:   accessToken,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Provider:      providerWithDefault(req.AuthMethod, req.Provider),
+		Region:        req.Region,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerURL:     req.IssuerURL,
+		Scopes:        req.Scopes,
+		// external_idp refresh returns "" for profileArn by design; fall back to
+		// the helper-provided ARN. If both empty, ResolveProfileArn discovers it
+		// lazily on first use (incl. the cross-region probe for external_idp).
+		ProfileArn: pickProfileArn(newProfileArn, req.ProfileArn),
+		ExpiresAt:  expiresAt,
+		Enabled:    true,
+		MachineId:  config.GenerateMachineId(),
+	}
+
+	if err := config.AddAccount(account); err != nil {
+		return config.Account{}, err
+	}
+	return account, nil
+}
+
+// pickProfileArn prefers a freshly-resolved ARN, falling back to the one the
+// helper persisted, then empty (resolved lazily on first use).
+func pickProfileArn(resolved, fromHelper string) string {
+	if strings.TrimSpace(resolved) != "" {
+		return resolved
+	}
+	return strings.TrimSpace(fromHelper)
+}
+
+// apiImportCliJson ingests one or many CLIProxyAPI_*.json documents produced by
+// kiro-login-helper.py (the standalone Microsoft 365 / Entra ID sign-in helper).
+// It accepts a single helper object, a JSON array, a { "files": [...] } /
+// { "accounts": [...] } wrapper, or raw text with several objects, normalizes
+// each (snake_case native, camelCase tolerated), and imports through the same
+// importOne core the legacy endpoint uses. Per-item results are returned so a
+// partial batch still reports which credentials landed.
+func (h *Handler) apiImportCliJson(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
+	}
+
+	reqs, warnings, err := normalizeCliJson(body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  false,
+			"error":    err.Error(),
+			"warnings": warnings,
+		})
+		return
+	}
+
+	var imported []map[string]interface{}
+	var errs []string
+	for i, req := range reqs {
+		account, impErr := h.importOne(req)
+		if impErr != nil {
+			errs = append(errs, fmt.Sprintf("item %d: %s", i+1, impErr.Error()))
+			continue
+		}
+		imported = append(imported, map[string]interface{}{
+			"id":         account.ID,
+			"email":      account.Email,
+			"authMethod": account.AuthMethod,
+		})
+	}
+
+	if len(imported) > 0 {
+		h.pool.Reload()
+	}
+
+	// Match the batch convention in apiImportSsoToken: 500 only when nothing landed.
+	if len(imported) == 0 {
+		w.WriteHeader(500)
+		errMsg := "no credentials imported"
+		if len(errs) > 0 {
+			errMsg = strings.Join(errs, "; ")
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  false,
+			"error":    errMsg,
+			"warnings": warnings,
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"imported": imported,
+		"errors":   errs,
+		"warnings": warnings,
+	})
+}
+
+// apiImportIdeCache imports the credential the Kiro IDE already cached on this
+// host (~/.aws/sso/cache/kiro-auth-token.json), with no browser sign-in. The
+// optional JSON body { "path": "..." } overrides the cache location (else the
+// KIRO_IDE_CACHE env var, else the default path). It funnels through the same
+// importOne core as every other import path, so the persisted account is
+// identical to an interactive Enterprise SSO login.
+func (h *Handler) apiImportIdeCache(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path string `json:"path"`
+	}
+	// Body is optional; ignore a decode error (including an empty body).
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	path := ideCachePath(body.Path)
+	req, err := readIdeCacheCredential(path)
+	if err != nil {
+		w.WriteHeader(importErrorStatus(err))
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	account, err := h.importOne(req)
+	if err != nil {
+		w.WriteHeader(importErrorStatus(err))
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
+	logger.Infof("[Import] %s (account %s)", describeIdeCacheImport(path, account.AuthMethod), account.Email)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"source":  path,
+		"account": map[string]interface{}{
+			"id":         account.ID,
+			"email":      account.Email,
+			"authMethod": account.AuthMethod,
 		},
 	})
 }

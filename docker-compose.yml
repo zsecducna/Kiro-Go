@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   kiro-go:
     build: .
@@ -22,6 +20,11 @@ services:
       - ./data/imports:/app/data/imports
     environment:
       - CONFIG_PATH=/app/data/config.json
+      # Force the app's in-container listen port to match the published
+      # container-side port above. This prevents a stale data/config.json port
+      # (for example 8081) from making `localhost:8080` unreachable.
+      - PORT=8080
+      - HOST=0.0.0.0
       # Enable the auto-ingest watcher (off by default on a bare build). Drop a
       # CLIProxyAPI_*.json into ./data/imports and the account appears with no
       # restart and no manual API call. Imports go through the same persisted path

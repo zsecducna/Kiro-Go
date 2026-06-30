@@ -430,3 +430,33 @@ func TestComputeBreakdownClampedToCreation(t *testing.T) {
 			usage.CacheCreation1hInputTokens, usage.CacheCreationInputTokens)
 	}
 }
+
+// TestComputeBreakdownClampedToCreationEmptyCacheBelowMin verifies the empty-cache
+// (first-request) path still preserves the Anthropic invariant
+// cache_creation_input_tokens == ephemeral_5m + ephemeral_1h when the input is
+// below the minimum-cacheable threshold. effectiveCreation is zeroed
+// (lastTokens < minTokens), but computePromptCacheTTLBreakdown(profile, 0) still
+// returns lastTokens > 0 — the empty-path clamp (cache_tracker.go:255) must force
+// 5m/1h to 0 so message_start doesn't emit an invariant-violating usage. Guards
+// the empty-cache clamp site, which the matched-path TestComputeBreakdownClampedToCreation
+// does not exercise (it always has lastTokens >= minTokens).
+func TestComputeBreakdownClampedToCreationEmptyCacheBelowMin(t *testing.T) {
+	tr := newPromptCacheTracker(time.Hour) // empty → empty-cache (first-request) path
+	profile := &promptCacheProfile{
+		Model:            "claude-sonnet-4-6", // minTokens = 1024 (non-opus default)
+		TotalInputTokens: 200,
+		Breakpoints: []promptCacheBreakpoint{
+			{Fingerprint: [32]byte{1}, CumulativeTokens: 100, TTL: time.Hour}, // 100 < 1024 → effectiveCreation = 0
+		},
+	}
+
+	usage := tr.Compute("acct", profile)
+
+	if usage.CacheCreationInputTokens != 0 {
+		t.Fatalf("below-minTokens first request should yield zero creation; got %d", usage.CacheCreationInputTokens)
+	}
+	if sum := usage.CacheCreation5mInputTokens + usage.CacheCreation1hInputTokens; sum != usage.CacheCreationInputTokens {
+		t.Fatalf("breakdown must sum to creation (empty path, below min): 5m=%d 1h=%d creation=%d",
+			usage.CacheCreation5mInputTokens, usage.CacheCreation1hInputTokens, usage.CacheCreationInputTokens)
+	}
+}

@@ -5,42 +5,32 @@ import (
 	"time"
 )
 
-// TestPromptCacheEvictsLRUWhenOverCapacity verifies the entries map is bounded:
-// once it exceeds maxPromptCacheEntries, the least-recently-hit entries are
-// evicted down to the cap.
-func TestPromptCacheEvictsLRUWhenOverCapacity(t *testing.T) {
-	tr := newPromptCacheTracker(time.Hour)
+// TestPromptCacheLRUEvictsOldestUnused verifies the list-based LRU: with cap 3,
+// after inserting a,b,c, touching a, then inserting d, the evicted entry is b
+// (the least-recently-used), not a.
+func TestPromptCacheLRUEvictsOldestUnused(t *testing.T) {
+	tr := newPromptCacheTrackerWithCapacity(time.Hour, 3)
 	now := time.Now()
 
-	total := maxPromptCacheEntries + 5
-	for i := 0; i < total; i++ {
-		var fp [32]byte
-		fp[0] = byte(i)
-		fp[1] = byte(i >> 8)
-		fp[2] = byte(i >> 16)
-		tr.entries[fp] = promptCacheEntry{
-			ExpiresAt: now.Add(time.Hour),
-			TTL:       time.Hour,
-			LastHit:   now.Add(time.Duration(i) * time.Second), // i=0 oldest
-		}
-	}
-
 	tr.mu.Lock()
-	tr.evictLRULocked()
+	tr.putLocked([32]byte{1}, now.Add(time.Hour), time.Hour) // a
+	tr.putLocked([32]byte{2}, now.Add(time.Hour), time.Hour) // b
+	tr.putLocked([32]byte{3}, now.Add(time.Hour), time.Hour) // c
+	tr.putLocked([32]byte{1}, now.Add(time.Hour), time.Hour) // touch a → front
+	tr.putLocked([32]byte{4}, now.Add(time.Hour), time.Hour) // d
+	tr.evictOverflowLocked()                                 // cap 3 → evict back (b)
 	tr.mu.Unlock()
 
-	if len(tr.entries) != maxPromptCacheEntries {
-		t.Fatalf("expected %d entries after eviction, got %d", maxPromptCacheEntries, len(tr.entries))
+	if _, ok := tr.entries[[32]byte{2}]; ok {
+		t.Fatalf("expected least-recently-used entry (b) to be evicted")
 	}
-	// The 5 oldest (i=0..4) must be the ones evicted.
-	for i := 0; i < 5; i++ {
-		var fp [32]byte
-		fp[0] = byte(i)
-		fp[1] = byte(i >> 8)
-		fp[2] = byte(i >> 16)
-		if _, ok := tr.entries[fp]; ok {
-			t.Fatalf("expected least-recently-hit entry %d to be evicted", i)
+	for _, want := range [][32]byte{{1}, {3}, {4}} {
+		if _, ok := tr.entries[want]; !ok {
+			t.Fatalf("expected entry %v to survive", want)
 		}
+	}
+	if got := len(tr.entries); got != 3 {
+		t.Fatalf("expected cap=3 after eviction, got %d", got)
 	}
 }
 
@@ -106,7 +96,9 @@ func TestComputeSetsDirtyOnCacheHit(t *testing.T) {
 		},
 	}
 	now := time.Now()
-	tr.entries[[32]byte{1}] = promptCacheEntry{ExpiresAt: now.Add(time.Hour), TTL: time.Hour, LastHit: now}
+	tr.mu.Lock()
+	tr.putLocked([32]byte{1}, now.Add(time.Hour), time.Hour)
+	tr.mu.Unlock()
 	tr.dirty = false
 
 	tr.Compute("acct", profile)

@@ -359,10 +359,7 @@ func TestPromptCacheDiskPersistence(t *testing.T) {
 	var fp [32]byte
 	copy(fp[:], hasher.Sum(nil))
 	t1.mu.Lock()
-	t1.entries[fp] = promptCacheEntry{
-		ExpiresAt: time.Now().Add(3 * time.Minute),
-		TTL:       5 * time.Minute,
-	}
+	t1.putLocked(fp, time.Now().Add(3*time.Minute), 5*time.Minute)
 	t1.dirty = true
 	t1.mu.Unlock()
 	t1.flush(path)
@@ -382,10 +379,7 @@ func TestPromptCacheDiskPersistence(t *testing.T) {
 	t1b := newPromptCacheTracker(5 * time.Minute)
 	t1b.mu.Lock()
 	fpExpired := sha256.Sum256([]byte("expired"))
-	t1b.entries[fpExpired] = promptCacheEntry{
-		ExpiresAt: time.Now().Add(-1 * time.Minute), // already expired
-		TTL:       5 * time.Minute,
-	}
+	t1b.putLocked(fpExpired, time.Now().Add(-1*time.Minute), 5*time.Minute) // already expired
 	t1b.dirty = true
 	t1b.mu.Unlock()
 	t1b.flush(path2)
@@ -417,7 +411,9 @@ func TestComputeBreakdownClampedToCreation(t *testing.T) {
 		},
 	}
 	now := time.Now()
-	tr.entries[[32]byte{1}] = promptCacheEntry{ExpiresAt: now.Add(time.Hour), TTL: time.Hour, LastHit: now}
+	tr.mu.Lock()
+	tr.putLocked([32]byte{1}, now.Add(time.Hour), time.Hour)
+	tr.mu.Unlock()
 
 	usage := tr.Compute("acct", profile)
 
@@ -486,5 +482,13 @@ func TestPromptCacheMaxEntriesConfigurable(t *testing.T) {
 	}
 	if got := config.GetPromptCacheMaxEntries(); got != 131072 {
 		t.Fatalf("zero should fall back to default 131072, got %d", got)
+	}
+
+	// An explicit small value is clamped to the 256 floor.
+	if err := config.UpdatePromptCacheMaxEntries(10); err != nil {
+		t.Fatalf("set small: %v", err)
+	}
+	if got := config.GetPromptCacheMaxEntries(); got != 256 {
+		t.Fatalf("small value 10 should clamp to 256, got %d", got)
 	}
 }

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"container/list"
 	"crypto/sha256"
 	"encoding/json"
 	"kiro-go/config"
@@ -21,10 +22,6 @@ const defaultPromptCacheTTL = 5 * time.Minute
 // short requests.
 const defaultMinCacheableTokens = 1024
 const opusMinCacheableTokens = 4096
-
-// maxPromptCacheEntries bounds the in-memory cache map; once exceeded, the
-// least-recently-hit entries are evicted (LRU), mirroring kiro-rs's cap.
-const maxPromptCacheEntries = 4096
 
 type promptCacheUsage struct {
 	CacheCreationInputTokens   int
@@ -56,12 +53,14 @@ func minCacheableTokensForModel(model string) int {
 type promptCacheEntry struct {
 	ExpiresAt time.Time
 	TTL       time.Duration
-	LastHit   time.Time // for LRU eviction
+	lruElem   *list.Element // back-ref into t.order; Value = fingerprint [32]byte
 }
 
 type promptCacheTracker struct {
 	mu              sync.Mutex
-	entries         map[[32]byte]promptCacheEntry
+	entries         map[[32]byte]*promptCacheEntry
+	order           *list.List // front = most-recently-used; Element.Value = [32]byte fingerprint
+	maxEntries      int
 	maxSupportedTTL time.Duration
 	dirty           bool
 	stopChan        chan struct{}
@@ -69,11 +68,17 @@ type promptCacheTracker struct {
 }
 
 func newPromptCacheTracker(maxTTL time.Duration) *promptCacheTracker {
+	return newPromptCacheTrackerWithCapacity(maxTTL, config.GetPromptCacheMaxEntries())
+}
+
+func newPromptCacheTrackerWithCapacity(maxTTL time.Duration, maxEntries int) *promptCacheTracker {
 	if maxTTL <= 0 {
 		maxTTL = defaultPromptCacheTTL
 	}
 	return &promptCacheTracker{
-		entries:         make(map[[32]byte]promptCacheEntry),
+		entries:         make(map[[32]byte]*promptCacheEntry),
+		order:           list.New(),
+		maxEntries:      maxEntries,
 		maxSupportedTTL: maxTTL,
 	}
 }
@@ -108,11 +113,7 @@ func (t *promptCacheTracker) Load(path string) {
 		if !exp.After(now) {
 			continue // already expired
 		}
-		t.entries[e.Fingerprint] = promptCacheEntry{
-			ExpiresAt: exp,
-			TTL:       time.Duration(e.TTLSeconds) * time.Second,
-			LastHit:   now,
-		}
+		t.putLocked(e.Fingerprint, exp, time.Duration(e.TTLSeconds)*time.Second)
 	}
 }
 
@@ -281,9 +282,8 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 			continue
 		}
 		entry.ExpiresAt = now.Add(entry.TTL)
-		entry.LastHit = now
-		t.entries[breakpoint.Fingerprint] = entry
-		t.dirty = true // hit extends TTL/LastHit — persist so a flush before the next Update doesn't lose it
+		t.order.MoveToFront(entry.lruElem)
+		t.dirty = true // hit extends TTL — persist so a flush before the next Update doesn't lose it
 		matchedTokens = minInt(breakpoint.CumulativeTokens, profile.TotalInputTokens)
 		if matchedTokens > lastTokens {
 			matchedTokens = lastTokens
@@ -319,44 +319,46 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 		if breakpoint.CumulativeTokens < minTokens {
 			continue
 		}
-		t.entries[breakpoint.Fingerprint] = promptCacheEntry{
-			ExpiresAt: now.Add(breakpoint.TTL),
-			TTL:       breakpoint.TTL,
-			LastHit:   now,
-		}
+		t.putLocked(breakpoint.Fingerprint, now.Add(breakpoint.TTL), breakpoint.TTL)
 	}
 	t.dirty = true
-	t.evictLRULocked()
+	t.evictOverflowLocked()
 }
 
 func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
 	for fingerprint, entry := range t.entries {
 		if !entry.ExpiresAt.After(now) {
+			t.order.Remove(entry.lruElem)
 			delete(t.entries, fingerprint)
 		}
 	}
 }
 
-// evictLRULocked bounds the entries map: when it exceeds maxPromptCacheEntries,
-// the least-recently-hit entries are removed down to the cap. Caller holds t.mu.
-func (t *promptCacheTracker) evictLRULocked() {
-	overflow := len(t.entries) - maxPromptCacheEntries
-	if overflow <= 0 {
+// putLocked inserts a fingerprint or refreshes its existing entry, marking it
+// most-recently-used. Caller holds t.mu.
+func (t *promptCacheTracker) putLocked(fp [32]byte, expiresAt time.Time, ttl time.Duration) {
+	if e, ok := t.entries[fp]; ok {
+		e.ExpiresAt = expiresAt
+		e.TTL = ttl
+		t.order.MoveToFront(e.lruElem)
 		return
 	}
-	type fpHit struct {
-		fp  [32]byte
-		hit time.Time
-	}
-	all := make([]fpHit, 0, len(t.entries))
-	for fp, e := range t.entries {
-		all = append(all, fpHit{fp, e.LastHit})
-	}
-	sort.Slice(all, func(i, j int) bool {
-		return all[i].hit.Before(all[j].hit)
-	})
-	for i := 0; i < overflow; i++ {
-		delete(t.entries, all[i].fp)
+	elem := t.order.PushFront(fp)
+	t.entries[fp] = &promptCacheEntry{ExpiresAt: expiresAt, TTL: ttl, lruElem: elem}
+}
+
+// evictOverflowLocked bounds the entries map to maxEntries by evicting the
+// least-recently-used entries (the back of the order list). O(1) per eviction.
+// Caller holds t.mu.
+func (t *promptCacheTracker) evictOverflowLocked() {
+	for len(t.entries) > t.maxEntries {
+		back := t.order.Back()
+		if back == nil {
+			return
+		}
+		fp := back.Value.([32]byte)
+		t.order.Remove(back)
+		delete(t.entries, fp)
 	}
 }
 

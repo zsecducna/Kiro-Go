@@ -956,15 +956,21 @@ func UpdatePromptCacheMaxRatio(ratio float64) error {
 }
 
 const defaultPromptCacheMaxEntries = 131072
+const minPromptCacheEntries = 256
 
 // GetPromptCacheMaxEntries returns the prompt-cache LRU bound. Defaults to
-// 131072 when unset (≤ 0). Explicit small values are clamped up to 256 by the
-// tracker constructor.
+// 131072 when unset (≤ 0); an explicit small value is clamped up to
+// minPromptCacheEntries (256) so a misconfigured tiny value cannot make the
+// cache useless. This is the production safety floor — the tracker constructor
+// trusts its caller (tests may use any capacity).
 func GetPromptCacheMaxEntries() int {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	if cfg == nil || cfg.PromptCacheMaxEntries <= 0 {
 		return defaultPromptCacheMaxEntries
+	}
+	if cfg.PromptCacheMaxEntries < minPromptCacheEntries {
+		return minPromptCacheEntries
 	}
 	return cfg.PromptCacheMaxEntries
 }

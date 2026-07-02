@@ -551,3 +551,56 @@ func TestCacheChurnsAtLowCapacity(t *testing.T) {
 		t.Fatalf("expected oldest prefix churned at cap=4096; got cache_read=%d", usage.CacheReadInputTokens)
 	}
 }
+
+// TestCacheStats verifies the atomic counters and Stats() snapshot: one miss,
+// one hit, one expiration, and one LRU eviction are all counted, and capacity
+// reflects the configured bound.
+func TestCacheStats(t *testing.T) {
+	tr := newPromptCacheTrackerWithCapacity(time.Hour, 3)
+	hit := &promptCacheProfile{
+		Model:            "claude-sonnet-4-6",
+		TotalInputTokens: 2000,
+		Breakpoints:      []promptCacheBreakpoint{{Fingerprint: [32]byte{7}, CumulativeTokens: 2000, TTL: time.Hour}},
+	}
+	now := time.Now()
+
+	// Seed an already-expired entry, then Compute: pruneExpiredLocked drops it
+	// (expirations=1) and the empty cache yields a miss (misses=1).
+	tr.mu.Lock()
+	tr.putLocked([32]byte{99}, now.Add(-time.Minute), time.Hour)
+	tr.mu.Unlock()
+	tr.Compute("acct", hit)
+
+	// Store the hit profile, then Compute → hit (hits=1).
+	tr.Update("acct", hit)
+	tr.Compute("acct", hit)
+
+	// Overflow: entries were {7}; add 3 more → {7,1,2,3} len=4 →
+	// evictOverflowLocked pops the LRU back (7), leaving 3 (evictions=1).
+	tr.mu.Lock()
+	for i := 1; i <= 3; i++ {
+		tr.putLocked([32]byte{byte(i)}, now.Add(time.Hour), time.Hour)
+	}
+	tr.evictOverflowLocked()
+	tr.mu.Unlock()
+
+	stats := tr.Stats()
+	if stats.Hits != 1 {
+		t.Errorf("hits = %d, want 1", stats.Hits)
+	}
+	if stats.Misses != 1 {
+		t.Errorf("misses = %d, want 1", stats.Misses)
+	}
+	if stats.Evictions != 1 {
+		t.Errorf("evictions = %d, want 1", stats.Evictions)
+	}
+	if stats.Expirations != 1 {
+		t.Errorf("expirations = %d, want 1", stats.Expirations)
+	}
+	if stats.Capacity != 3 {
+		t.Errorf("capacity = %d, want 3", stats.Capacity)
+	}
+	if stats.Entries != 3 {
+		t.Errorf("entries = %d, want 3", stats.Entries)
+	}
+}

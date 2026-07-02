@@ -208,6 +208,13 @@ type Config struct {
 	// where the newest content is minimal and >85% of input is genuinely from cache.
 	PromptCacheMaxRatio float64 `json:"promptCacheMaxRatio,omitempty"`
 
+	// PromptCacheMaxEntries bounds the in-memory prompt-cache map; once exceeded,
+	// the least-recently-used entries are evicted (LRU). Default 131072. Sized so
+	// the prefix write-rate × TTL does not evict multi-turn history prefixes
+	// before the next turn reuses them (mirrors kiro-rs's 131072 default). The
+	// tracker clamps explicit small values up to 256.
+	PromptCacheMaxEntries int `json:"promptCacheMaxEntries,omitempty"`
+
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
 	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
@@ -867,6 +874,30 @@ func UpdatePromptCacheMaxRatio(ratio float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.PromptCacheMaxRatio = ratio
+	return Save()
+}
+
+const defaultPromptCacheMaxEntries = 131072
+
+// GetPromptCacheMaxEntries returns the prompt-cache LRU bound. Defaults to
+// 131072 when unset (≤ 0). Explicit small values are clamped up to 256 by the
+// tracker constructor.
+func GetPromptCacheMaxEntries() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.PromptCacheMaxEntries <= 0 {
+		return defaultPromptCacheMaxEntries
+	}
+	return cfg.PromptCacheMaxEntries
+}
+
+// UpdatePromptCacheMaxEntries sets the prompt-cache LRU bound and persists it.
+// Applies on the next tracker construction (restart); it does not resize a
+// live tracker.
+func UpdatePromptCacheMaxEntries(n int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PromptCacheMaxEntries = n
 	return Save()
 }
 

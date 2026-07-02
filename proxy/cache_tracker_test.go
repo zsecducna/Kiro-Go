@@ -460,3 +460,31 @@ func TestComputeBreakdownClampedToCreationEmptyCacheBelowMin(t *testing.T) {
 			usage.CacheCreation5mInputTokens, usage.CacheCreation1hInputTokens, usage.CacheCreationInputTokens)
 	}
 }
+
+// TestPromptCacheMaxEntriesConfigurable verifies the cache LRU bound is
+// configurable via config and defaults to 131072.
+func TestPromptCacheMaxEntriesConfigurable(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	if got := config.GetPromptCacheMaxEntries(); got != 131072 {
+		t.Fatalf("default cap: expected 131072, got %d", got)
+	}
+
+	if err := config.UpdatePromptCacheMaxEntries(50000); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got := config.GetPromptCacheMaxEntries(); got != 50000 {
+		t.Fatalf("after update: expected 50000, got %d", got)
+	}
+
+	// ≤ 0 falls back to the default.
+	if err := config.UpdatePromptCacheMaxEntries(0); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	if got := config.GetPromptCacheMaxEntries(); got != 131072 {
+		t.Fatalf("zero should fall back to default 131072, got %d", got)
+	}
+}

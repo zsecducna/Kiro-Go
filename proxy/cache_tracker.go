@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -62,6 +63,10 @@ type promptCacheTracker struct {
 	order           *list.List // front = most-recently-used; Element.Value = [32]byte fingerprint
 	maxEntries      int
 	maxSupportedTTL time.Duration
+	hits            int64 // atomic — Compute calls returning CacheReadInputTokens > 0
+	misses          int64 // atomic — Compute calls returning CacheReadInputTokens == 0
+	evictions       int64 // atomic — LRU pop-backs in evictOverflowLocked
+	expirations     int64 // atomic — TTL removals in pruneExpiredLocked
 	dirty           bool
 	stopChan        chan struct{}
 	stopOnce        sync.Once
@@ -232,10 +237,17 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 }
 
-func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) promptCacheUsage {
+func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) (u promptCacheUsage) {
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
 		return promptCacheUsage{}
 	}
+	defer func() {
+		if u.CacheReadInputTokens > 0 {
+			atomic.AddInt64(&t.hits, 1)
+		} else {
+			atomic.AddInt64(&t.misses, 1)
+		}
+	}()
 
 	minTokens := minCacheableTokensForModel(profile.Model)
 	last := profile.Breakpoints[len(profile.Breakpoints)-1]
@@ -330,6 +342,7 @@ func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
 		if !entry.ExpiresAt.After(now) {
 			t.order.Remove(entry.lruElem)
 			delete(t.entries, fingerprint)
+			atomic.AddInt64(&t.expirations, 1)
 		}
 	}
 }
@@ -359,6 +372,36 @@ func (t *promptCacheTracker) evictOverflowLocked() {
 		fp := back.Value.([32]byte)
 		t.order.Remove(back)
 		delete(t.entries, fp)
+		atomic.AddInt64(&t.evictions, 1)
+	}
+}
+
+// PromptCacheStats is a point-in-time snapshot of cache counters, surfaced via
+// /v1/stats. All counters are cumulative since tracker construction.
+type PromptCacheStats struct {
+	Entries     int   `json:"entries"`
+	Capacity    int   `json:"capacity"`
+	Hits        int64 `json:"hits"`
+	Misses      int64 `json:"misses"`
+	Evictions   int64 `json:"evictions"`
+	Expirations int64 `json:"expirations"`
+}
+
+func (t *promptCacheTracker) Stats() PromptCacheStats {
+	if t == nil {
+		return PromptCacheStats{}
+	}
+	t.mu.Lock()
+	entries := len(t.entries)
+	capacity := t.maxEntries
+	t.mu.Unlock()
+	return PromptCacheStats{
+		Entries:     entries,
+		Capacity:    capacity,
+		Hits:        atomic.LoadInt64(&t.hits),
+		Misses:      atomic.LoadInt64(&t.misses),
+		Evictions:   atomic.LoadInt64(&t.evictions),
+		Expirations: atomic.LoadInt64(&t.expirations),
 	}
 }
 

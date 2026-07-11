@@ -3069,9 +3069,22 @@ func (h *Handler) apiSwitchAccountKiroProfile(w http.ResponseWriter, r *http.Req
 		return
 	}
 	h.pool.Reload()
+
+	// The model list is region-scoped: a profile in another region can expose a
+	// different set, so refresh the cache for the new pin right away instead of
+	// serving the old region's models until the next scheduled refresh. Failure
+	// here must not undo the switch — the ARN is already persisted — so it is
+	// reported alongside success rather than as an error status.
+	account.ProfileArn = req.ProfileArn
+	modelsRefreshed := true
+	if err := h.fetchAndCacheAccountModels(account); err != nil {
+		modelsRefreshed = false
+		logger.Warnf("[ProfileArn] Model refresh after profile switch failed for %s: %v", accountEmailForLog(account), err)
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":    true,
-		"profileArn": req.ProfileArn,
+		"success":         true,
+		"profileArn":      req.ProfileArn,
+		"modelsRefreshed": modelsRefreshed,
 	})
 }
 

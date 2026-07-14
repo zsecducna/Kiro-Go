@@ -407,11 +407,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"status":"ok"}`))
 
 	// 客户自助端点（用客户自己的 API Key 鉴权，只暴露该 Key 的数据）
-	case path == "/api/stats" && r.Method == "GET":
+	// 只读自省端点：同时接受 GET 与 POST，方便机器人用任一动词查询（POST 请求体忽略）。
+	case path == "/api/stats" && (r.Method == "GET" || r.Method == "POST"):
 		h.handleCustomerStats(w, r)
-	case path == "/api/me" && r.Method == "GET":
+	case path == "/api/me" && (r.Method == "GET" || r.Method == "POST"):
 		h.handleCustomerMe(w, r)
-	case path == "/api/logs" && r.Method == "GET":
+	case path == "/api/logs" && (r.Method == "GET" || r.Method == "POST"):
 		h.handleCustomerLogs(w, r)
 
 	// 机器集成管理端点（Telegram 机器人等；管理密钥鉴权）。

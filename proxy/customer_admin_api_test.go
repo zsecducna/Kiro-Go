@@ -94,6 +94,23 @@ func TestCustomerMeReturnsQuota(t *testing.T) {
 	}
 }
 
+// The self-service introspection endpoints must answer on both GET and POST so
+// the bot can query with either verb; a POST body is ignored.
+func TestCustomerIntrospectionAcceptsPost(t *testing.T) {
+	mustInitConfig(t)
+	entry := seedKey(t, "buyer-post", 1000, 250)
+	h := &Handler{}
+
+	for _, path := range []string{"/api/me", "/api/stats", "/api/logs"} {
+		r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"ignored":true}`))
+		r.Header.Set("X-Api-Key", entry.Key)
+		rec := serve(h, r)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST %s: expected 200, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 // Exhausted (auto-disabled) keys must still be able to read their own stats.
 func TestCustomerMeWorksAfterExhaustion(t *testing.T) {
 	mustInitConfig(t)

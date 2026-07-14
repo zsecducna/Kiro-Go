@@ -297,6 +297,18 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		finalContent = minimalFallbackUserContent
 	}
 
+	// Orphan tool results (the current toolResults do not answer the last history
+	// assistant's structured tool calls) cannot stay structured — Kiro's upstream
+	// rejects them. When the current message also carries text or an image, the
+	// chain above takes that path and the narration branch is skipped, which
+	// would silently drop the tool-result text. Fold it into finalContent so
+	// neither the text nor the image is lost.
+	if !keepCurrentToolResults && len(currentToolResults) > 0 {
+		if continuation := buildToolResultsContinuation(currentToolResults); continuation != finalContent {
+			finalContent = finalContent + "\n\n" + continuation
+		}
+	}
+
 	// 转换工具
 	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
 
@@ -1239,6 +1251,17 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			finalContent = buildToolResultsContinuation(currentToolResults)
 		} else {
 			finalContent = minimalFallbackUserContent
+		}
+	}
+
+	// Orphan tool results cannot stay structured — Kiro's upstream rejects them.
+	// When the current message also carries an image, the block above takes the
+	// image-placeholder path and the narration branch is skipped, which would
+	// silently drop the tool-result text. Fold it into finalContent. See
+	// ClaudeToKiro for the full rationale.
+	if !keepCurrentToolResults && len(currentToolResults) > 0 {
+		if continuation := buildToolResultsContinuation(currentToolResults); continuation != finalContent {
+			finalContent = finalContent + "\n\n" + continuation
 		}
 	}
 

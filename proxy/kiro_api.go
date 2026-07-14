@@ -7,6 +7,7 @@ import (
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -627,61 +628,70 @@ func setKiroHeaders(req *http.Request, account *config.Account) {
 	applyKiroBaseHeaders(req, account, headerValues)
 }
 
+// classifyAndBanOnUsageError inspects a GetUsageLimits error and disables the
+// account when it signals a hard upstream state (suspension or auth failure).
+// Classification routes through the shared pool.IsSuspensionError /
+// pool.IsAuthFailure helpers (digit-boundary-aware) instead of bare
+// strings.Contains, which previously false-banned accounts when "401"/"403"
+// appeared inside request IDs or timestamps. Returns the caller-facing error.
+func classifyAndBanOnUsageError(account *config.Account, err error) error {
+	// Profile ARN resolution may fail transiently (provisioning lag, cross-region
+	// probe failure). The request path treats this as soft (account_failover.go);
+	// the background refresh path must too, or a good external_idp account is
+	// permanently banned on a transient blip.
+	if isProfileUnavailableErrorMessage(err.Error()) {
+		return fmt.Errorf("GetUsageLimits: %w", err)
+	}
+	switch {
+	case pool.IsSuspensionError(err):
+		logger.Warnf("[RefreshAccountInfo] Account %s is suspended: %v", account.Email, err)
+		banAccountInline(account, "BANNED", "AWS temporarily suspended - unusual user activity detected")
+		return fmt.Errorf("Account suspended: %w", err)
+	case pool.IsAuthFailure(err):
+		logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", account.Email, err)
+		banAccountInline(account, "BANNED", "Authentication failed - token invalid or expired")
+	}
+	return fmt.Errorf("GetUsageLimits: %w", err)
+}
+
+// banAccountInline disables an account (banStatus + reason) via config. Used by
+// background-refresh paths that have no Handler/pool handle. No-op if the
+// account is already disabled with the same status/reason.
+func banAccountInline(account *config.Account, banStatus, banReason string) {
+	if account == nil {
+		return
+	}
+	updated := *account
+	if !updated.Enabled && updated.BanStatus == banStatus && updated.BanReason == banReason {
+		return
+	}
+	updated.Enabled = false
+	updated.BanStatus = banStatus
+	updated.BanReason = banReason
+	updated.BanTime = time.Now().Unix()
+	if err := config.UpdateAccount(account.ID, updated); err != nil {
+		logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", err)
+	}
+}
+
 // RefreshAccountInfo 刷新账户信息（使用量、订阅等）
 func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	info := &config.AccountInfo{
 		LastRefresh: time.Now().Unix(),
 	}
 
-	// 获取使用量和订阅信息
 	usage, err := GetUsageLimits(account)
 	if err != nil {
-		// 检测封禁状态
-		errMsg := err.Error()
 		// API-key accounts cannot self-heal (never token-refreshed), so no upstream
 		// error here should mutate/ban them — a transient blip must not brick a valid,
 		// paid key. This also protects the add-time probe, which reuses a throwaway
-		// api_key account: it must never write config (including the suspension branch
-		// below, which would call UpdateAccount with the throwaway's empty ID).
+		// api_key account: it must never write config (classifyAndBanOnUsageError
+		// would call UpdateAccount with the throwaway's empty ID). Guard BEFORE the
+		// classify/ban helper so both the suspension and auth-fail branches are skipped.
 		if account.IsApiKeyCredential() {
 			return nil, fmt.Errorf("GetUsageLimits: %w", err)
 		}
-		if strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") {
-			// 账户被暂时封禁，自动禁用并标记封禁状态
-			logger.Warnf("[RefreshAccountInfo] Account %s is temporarily suspended: %v", account.Email, err)
-
-			// 更新账户封禁状态并自动禁用
-			updatedAccount := *account
-			updatedAccount.Enabled = false
-			updatedAccount.BanStatus = "BANNED"
-			updatedAccount.BanReason = "AWS temporarily suspended - unusual user activity detected"
-			updatedAccount.BanTime = time.Now().Unix()
-
-			// 保存更新后的账户状态
-			if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
-				logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", updateErr)
-			}
-
-			return nil, fmt.Errorf("Account suspended: %w", err)
-		} else if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") ||
-			strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
-			// Token 相关错误，可能需要重新认证 (api_key accounts already returned above).
-			logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", account.Email, err)
-
-			// 更新账户封禁状态为认证失败并自动禁用
-			updatedAccount := *account
-			updatedAccount.Enabled = false
-			updatedAccount.BanStatus = "BANNED"
-			updatedAccount.BanReason = "Authentication failed - token invalid or expired"
-			updatedAccount.BanTime = time.Now().Unix()
-
-			// 保存更新后的账户状态
-			if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
-				logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", updateErr)
-			}
-		}
-
-		return nil, fmt.Errorf("GetUsageLimits: %w", err)
+		return nil, classifyAndBanOnUsageError(account, err)
 	}
 
 	// 如果成功获取信息，清除封禁状态（如果之前被标记）

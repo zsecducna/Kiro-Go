@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,27 +24,119 @@ var socialTokenURL = func() string {
 	return "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
 }
 
-// RefreshToken 刷新 access token
-// Returns: accessToken, refreshToken, expiresAt, profileArn, error
-func RefreshToken(account *config.Account) (string, string, int64, string, error) {
-	// Resolve per-account proxy: account.ProxyURL > global config
+// refreshSkewSeconds mirrors pool.tokenRefreshSkewSeconds: a token within this
+// many seconds of expiry is treated as expiring and refreshed proactively.
+// Kept local to auth to avoid a pool→auth import cycle.
+const refreshSkewSeconds int64 = 120
+
+var (
+	// refreshMu guards refreshLocks creation only; each per-account lock is then
+	// held for the duration of one refresh.
+	refreshMu sync.Mutex
+	// refreshLocks maps accountID → that account's refresh mutex. One lock per
+	// account serializes only that account's background refreshes, reducing the
+	// global contention the handler-level tokenRefreshMu imposed. tokenRefreshMu
+	// still guards the request-path refresh (handler.go:2148) and remains part of
+	// the documented lock order (account.go:250) — intentionally not removed.
+	// Account IDs are stable UUIDs; the map is bounded by the total number of
+	// accounts ever seen, which is negligible for this deployment.
+	refreshLocks = map[string]*sync.Mutex{}
+)
+
+// refreshLockFor returns the per-account refresh mutex, creating it on first use.
+func refreshLockFor(id string) *sync.Mutex {
+	refreshMu.Lock()
+	lock, ok := refreshLocks[id]
+	if !ok {
+		lock = &sync.Mutex{}
+		refreshLocks[id] = lock
+	}
+	refreshMu.Unlock()
+	return lock
+}
+
+// refreshTokenDirect resolves the proxy-aware HTTP client and dispatches to the
+// provider-specific refresh. It performs no locking or persistence — used both
+// for id-less accounts (login validation, which has no shared state to
+// coordinate against) and as the inner step of the locked RefreshToken.
+func refreshTokenDirect(account *config.Account) (string, string, int64, string, error) {
 	proxyURL := account.ProxyURL
 	if proxyURL == "" {
 		proxyURL = config.GetProxyURL()
 	}
 	client := GetAuthClientForProxy(proxyURL)
-
-	// External IdP (enterprise SSO, e.g. Azure AD) tokens are refreshed against the
-	// IdP token endpoint (refresh_token grant, public client), NOT the AWS SSO OIDC
-	// endpoint. Selecting it on AuthMethod (rather than letting it fall through to the
-	// OIDC branch, which requires clientSecret) is what makes these accounts refresh.
-	if account.AuthMethod == "external_idp" {
+	switch account.AuthMethod {
+	case "external_idp":
 		return refreshExternalIdpToken(account.RefreshToken, account.ClientID, account.TokenEndpoint, account.Scopes, client)
-	}
-	if account.AuthMethod == "social" {
+	case "social":
 		return refreshSocialToken(account.RefreshToken, client)
+	default:
+		return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
 	}
-	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
+}
+
+// RefreshToken refreshes the account's access token. For id-bearing accounts it
+// serializes per account with double-checked locking: concurrent callers for one
+// account collapse to a single IdP POST (the leader refreshes + persists under
+// the lock; followers re-read the now-fresh token from config and skip the
+// POST). This replaces the refresh-storm + lost-update race that occurred when
+// every concurrent request POSTed independently and raced writing back the
+// (rotated) refresh token.
+//
+// Returns: accessToken, refreshToken, expiresAt, profileArn, error.
+func RefreshToken(account *config.Account) (string, string, int64, string, error) {
+	if account == nil {
+		return "", "", 0, "", fmt.Errorf("RefreshToken: nil account")
+	}
+
+	// Id-less accounts (e.g. the login/add-account validation flow builds a
+	// temporary account) have no persisted state to coordinate against, so skip
+	// the lock + double-check and refresh directly (original behavior).
+	if account.ID == "" {
+		return refreshTokenDirect(account)
+	}
+
+	lock := refreshLockFor(account.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Double-checked locking: a concurrent refresh may have renewed the token
+	// while we waited. Re-read the canonical expiry from config; if it is still
+	// valid, propagate it and skip the IdP POST. Either way adopt the canonical
+	// fields (a concurrent refresh may have rotated the refresh token).
+	if live, ok := config.GetAccountByID(account.ID); ok {
+		*account = live
+		if now := time.Now().Unix(); live.ExpiresAt > 0 && now < live.ExpiresAt-refreshSkewSeconds {
+			return live.AccessToken, live.RefreshToken, live.ExpiresAt, live.ProfileArn, nil
+		}
+	}
+
+	accessToken, refreshToken, expiresAt, profileArn, err := refreshTokenDirect(account)
+	if err != nil {
+		return "", "", 0, "", err
+	}
+
+	// Persist under the lock so the next caller's double-check sees the fresh
+	// token — this is what collapses N concurrent refreshes into one IdP POST.
+	// (Existing handler call sites also persist; those writes are now idempotent
+	// no-ops and are left untouched per the no-call-site-change constraint.)
+	account.AccessToken = accessToken
+	if refreshToken != "" {
+		account.RefreshToken = refreshToken
+	}
+	account.ExpiresAt = expiresAt
+	if profileArn != "" {
+		account.ProfileArn = profileArn
+	}
+	if perr := config.UpdateAccountToken(account.ID, accessToken, refreshToken, expiresAt); perr != nil {
+		logger.Warnf("[RefreshToken] failed to persist refreshed token for %s: %v", account.Email, perr)
+	}
+	if profileArn != "" {
+		if perr := config.UpdateAccountProfileArn(account.ID, profileArn); perr != nil {
+			logger.Warnf("[RefreshToken] failed to persist profileArn for %s: %v", account.Email, perr)
+		}
+	}
+	return accessToken, refreshToken, expiresAt, profileArn, nil
 }
 
 // refreshExternalIdpToken refreshes an external-IdP (enterprise SSO) access token

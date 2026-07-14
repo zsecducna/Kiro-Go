@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
@@ -293,4 +294,93 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+// TestFalseBanSubstringNoLongerDisables verifies that a GetUsageLimits error
+// whose body merely contains "403"/"401" inside a request ID or timestamp does
+// NOT ban the account. The old bare strings.Contains(errMsg, "403") matched
+// these and false-banned healthy accounts.
+func TestFalseBanSubstringNoLongerDisables(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "acct", Enabled: true, Email: "a@b.c"}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	acc, _ := config.GetAccountByID("acct")
+
+	// "403" appears only inside a request-id token — bare substring matching
+	// would have banned this account; the digit-boundary classifier must not.
+	_ = classifyAndBanOnUsageError(&acc, errors.New("request_id req_403abc timestamp 1782568837 failed"))
+
+	got, _ := config.GetAccountByID("acct")
+	if !got.Enabled || got.BanStatus != "" {
+		t.Fatalf("account should NOT be banned for a 403-in-request-id error; got enabled=%v banStatus=%q", got.Enabled, got.BanStatus)
+	}
+}
+
+// TestRealSuspensionDisablesAccount verifies a real suspension signal still bans.
+func TestRealSuspensionDisablesAccount(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "acct", Enabled: true, Email: "a@b.c"}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	acc, _ := config.GetAccountByID("acct")
+
+	_ = classifyAndBanOnUsageError(&acc, errors.New("TEMPORARILY_SUSPENDED: account suspended"))
+
+	got, _ := config.GetAccountByID("acct")
+	if got.Enabled || got.BanStatus != "BANNED" {
+		t.Fatalf("suspension should ban the account; got enabled=%v banStatus=%q", got.Enabled, got.BanStatus)
+	}
+}
+
+// TestProfileUnavailableDoesNotBanAccount verifies a transient "no available
+// Kiro profile" error from GetUsageLimits does NOT permanently ban the account.
+// The background refresh path must mirror the request path's soft handling
+// (account_failover.go), or a good external_idp account is banned on a blip.
+func TestProfileUnavailableDoesNotBanAccount(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "acct", Enabled: true, Email: "a@b.c", Provider: "external_idp"}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	acc, _ := config.GetAccountByID("acct")
+
+	_ = classifyAndBanOnUsageError(&acc, errors.New("no available Kiro profile"))
+
+	got, _ := config.GetAccountByID("acct")
+	if !got.Enabled || got.BanStatus != "" {
+		t.Fatalf("profile-unavailable should NOT ban the account; got enabled=%v banStatus=%q", got.Enabled, got.BanStatus)
+	}
+}
+
+// TestClassifyAndBanOnUsageErrorBansOnGenuineAuthError verifies the background
+// refresh classifier still permanently bans an account on a genuine auth failure
+// (401) via the pool.IsAuthFailure branch — the positive complement to
+// TestFalseBanSubstringNoLongerDisables, which only proves a stray 403-in-token
+// does NOT ban. Without this, a refactor that dropped the auth ban would pass
+// all existing tests silently.
+func TestClassifyAndBanOnUsageErrorBansOnGenuineAuthError(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "acct", Enabled: true, Email: "a@b.c"}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	acc, _ := config.GetAccountByID("acct")
+
+	_ = classifyAndBanOnUsageError(&acc, errors.New("HTTP 401 from primary: unauthorized"))
+
+	got, _ := config.GetAccountByID("acct")
+	if got.Enabled || got.BanStatus != "BANNED" {
+		t.Fatalf("genuine auth error should ban the account via the background classifier; got enabled=%v banStatus=%q", got.Enabled, got.BanStatus)
+	}
 }

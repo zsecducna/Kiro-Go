@@ -192,6 +192,15 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// AutoRecoverEnabled controls whether disabled accounts (auth failure) are
+	// periodically re-probed with a token refresh. Default true. Set false to
+	// require manual re-enable.
+	AutoRecoverEnabled *bool `json:"autoRecoverEnabled,omitempty"`
+
+	// SessionAffinityEnabled binds consecutive requests from the same API key to
+	// the same account (sticky routing) for a TTL window. Default false.
+	SessionAffinityEnabled bool `json:"sessionAffinityEnabled,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -220,6 +229,18 @@ type Config struct {
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
 	// Can be overridden by the LOG_LEVEL environment variable.
 	LogLevel string `json:"logLevel,omitempty"`
+
+	// PromptCacheMaxRatio caps the fraction of input tokens reported as cache_read
+	// in a single turn. Default 0.85. Raise to 0.95 for "continue"-heavy workloads
+	// where the newest content is minimal and >85% of input is genuinely from cache.
+	PromptCacheMaxRatio float64 `json:"promptCacheMaxRatio,omitempty"`
+
+	// PromptCacheMaxEntries bounds the in-memory prompt-cache map; once exceeded,
+	// the least-recently-used entries are evicted (LRU). Default 131072. Sized so
+	// the prefix write-rate × TTL does not evict multi-turn history prefixes
+	// before the next turn reuses them (mirrors kiro-rs's 131072 default). The
+	// tracker clamps explicit small values up to 256.
+	PromptCacheMaxEntries int `json:"promptCacheMaxEntries,omitempty"`
 
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
@@ -421,6 +442,20 @@ func GetAccounts() []Account {
 	accounts := make([]Account, len(cfg.Accounts))
 	copy(accounts, cfg.Accounts)
 	return accounts
+}
+
+// GetAccountByID returns a copy of the account with the given ID, or ok=false
+// if no such account exists. Used by auth.RefreshToken's double-checked
+// locking to read the canonical token state.
+func GetAccountByID(id string) (Account, bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			return cfg.Accounts[i], true
+		}
+	}
+	return Account{}, false
 }
 
 // AccountIDExists reports whether an account with the given ID is already stored.
@@ -878,6 +913,36 @@ func GetAllowOverUsage() bool {
 	return cfg.AllowOverUsage
 }
 
+// GetAutoRecoverEnabled returns whether auto-recovery of disabled accounts is
+// enabled. Defaults to true.
+func GetAutoRecoverEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.AutoRecoverEnabled == nil {
+		return true
+	}
+	return *cfg.AutoRecoverEnabled
+}
+
+// GetSessionAffinityEnabled returns whether session affinity (sticky routing per
+// API key) is enabled. Defaults to false.
+func GetSessionAffinityEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.SessionAffinityEnabled
+}
+
+// SetSessionAffinityEnabled sets the session-affinity flag and persists it.
+func SetSessionAffinityEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.SessionAffinityEnabled = enabled
+	return Save()
+}
+
 // UpdateAllowOverUsage sets the over-usage setting and persists the change.
 func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
@@ -894,6 +959,54 @@ func GetLogLevel() string {
 		return "info"
 	}
 	return cfg.LogLevel
+}
+
+// GetPromptCacheMaxRatio returns the cache-read cap ratio (0.0-1.0). Defaults to 0.85.
+func GetPromptCacheMaxRatio() float64 {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.PromptCacheMaxRatio <= 0 || cfg.PromptCacheMaxRatio > 1 {
+		return 0.85
+	}
+	return cfg.PromptCacheMaxRatio
+}
+
+// UpdatePromptCacheMaxRatio sets the cache-read cap ratio and persists the change.
+func UpdatePromptCacheMaxRatio(ratio float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PromptCacheMaxRatio = ratio
+	return Save()
+}
+
+const defaultPromptCacheMaxEntries = 131072
+const minPromptCacheEntries = 256
+
+// GetPromptCacheMaxEntries returns the prompt-cache LRU bound. Defaults to
+// 131072 when unset (≤ 0); an explicit small value is clamped up to
+// minPromptCacheEntries (256) so a misconfigured tiny value cannot make the
+// cache useless. This is the production safety floor — the tracker constructor
+// trusts its caller (tests may use any capacity).
+func GetPromptCacheMaxEntries() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.PromptCacheMaxEntries <= 0 {
+		return defaultPromptCacheMaxEntries
+	}
+	if cfg.PromptCacheMaxEntries < minPromptCacheEntries {
+		return minPromptCacheEntries
+	}
+	return cfg.PromptCacheMaxEntries
+}
+
+// UpdatePromptCacheMaxEntries sets the prompt-cache LRU bound and persists it.
+// Applies on the next tracker construction (restart); it does not resize a
+// live tracker.
+func UpdatePromptCacheMaxEntries(n int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PromptCacheMaxEntries = n
+	return Save()
 }
 
 // UpdateLogLevel updates the log level setting and persists the change.

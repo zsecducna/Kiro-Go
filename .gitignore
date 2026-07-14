@@ -22,3 +22,14 @@ Thumbs.db
 # Local backups / scratch
 backup*/
 PR-*.md
+
+# Local scratch, debug artifacts, and credentials — never commit
+.credtest/
+accounts_*.txt
+dbg*.png
+debug*.png
+debug_*.py
+debug_*.txt
+kiro_sso_auto.py
+test_proofup_next.py
+guaranteed

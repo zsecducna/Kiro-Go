@@ -480,3 +480,48 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
 	}
 }
+
+// TestStatsIncludesCacheMetrics verifies /v1/stats surfaces a "cache" object
+// populated from the prompt-cache tracker's atomic counters (hits/misses).
+func TestStatsIncludesCacheMetrics(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	p := accountpool.GetPool()
+	p.Reload()
+
+	tr := newPromptCacheTracker(defaultPromptCacheTTL)
+	profile := &promptCacheProfile{
+		Model:            "claude-sonnet-4-6",
+		TotalInputTokens: 2000,
+		Breakpoints:      []promptCacheBreakpoint{{Fingerprint: [32]byte{9}, CumulativeTokens: 2000, TTL: time.Hour}},
+	}
+	tr.Compute("acct", profile) // miss (empty cache)
+	tr.Update("acct", profile)
+	tr.Compute("acct", profile) // hit
+
+	h := &Handler{
+		pool:        p,
+		promptCache: tr,
+		startTime:   time.Now().Unix(),
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleStats(rec, httptest.NewRequest(http.MethodGet, "/v1/stats", nil))
+
+	var got map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	cache, ok := got["cache"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected a cache object in stats, got %#v", got)
+	}
+	if cache["hits"].(float64) != 1 {
+		t.Fatalf("expected 1 hit, got %v", cache["hits"])
+	}
+	if cache["misses"].(float64) != 1 {
+		t.Fatalf("expected 1 miss, got %v", cache["misses"])
+	}
+}

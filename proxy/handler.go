@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
@@ -9,6 +10,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,17 +23,17 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	ApiKeyID  string `json:"apiKeyId,omitempty"` // API key entry that made the request (empty on legacy/unauthenticated paths)
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`               // Unix timestamp
+	Endpoint  string  `json:"endpoint"`           // claude/openai/responses
+	Model     string  `json:"model"`              // Requested model
+	AccountID string  `json:"accountId"`          // Account used
+	ApiKeyID  string  `json:"apiKeyId,omitempty"` // API key entry that made the request (empty on legacy/unauthenticated paths)
+	Status    string  `json:"status"`             // "success" or "error"
+	Error     string  `json:"error"`              // Error message (empty on success)
+	ErrorType string  `json:"errorType"`          // Error category (empty on success)
+	Tokens    int     `json:"tokens"`             // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`            // Credits consumed (0 on failure)
+	Duration  int64   `json:"duration"`           // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -246,6 +248,9 @@ func NewHandler() *Handler {
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 	}
+	cachePath := filepath.Join(config.GetConfigDir(), "prompt_cache.json")
+	h.promptCache.Load(cachePath)
+	h.promptCache.startSaveLoop(cachePath, 30*time.Second)
 	// 启动后台刷新
 	go h.backgroundRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
@@ -493,6 +498,7 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
 		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":    h.getCredits(),
+		"cache":           h.promptCache.Stats(),
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }
@@ -925,7 +931,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
 		if account == nil {
 			break
 		}
@@ -1280,6 +1286,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		// Re-anchor the cache split to the real upstream input total so
+		// input+creation+read stays consistent (cacheUsage was computed against
+		// the pre-call token estimate).
+		if cacheProfile != nil && realInputTokens > 0 {
+			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, inputTokens)
+		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -1292,6 +1304,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
@@ -1460,7 +1473,7 @@ func classifyError(msg string) string {
 		return "overage"
 	case isSuspensionErrorMessage(msg):
 		return "suspended"
-	case isAuthErrorMessage(msg):
+	case pool.IsAuthFailure(errors.New(msg)):
 		return "auth"
 	case isProfileUnavailableErrorMessage(msg):
 		return "profile"
@@ -1490,7 +1503,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
 		if account == nil {
 			break
 		}
@@ -1555,10 +1568,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		// Re-anchor the cache split to the real upstream input total so
+		// input+creation+read stays consistent (cacheUsage was computed against
+		// the pre-call token estimate).
+		if cacheProfile != nil && realInputTokens > 0 {
+			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, inputTokens)
+		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
@@ -1677,7 +1697,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
 		if account == nil {
 			break
 		}
@@ -1977,6 +1997,25 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
+			// Stream already started: cannot retry or send a JSON error. Terminate
+			// the SSE with a finish chunk so the client sees the failure instead of a
+			// silent truncation (mirrors handleClaudeStream's error SSE and
+			// handleResponsesStream's response.failed).
+			errChunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{{
+					"index":         0,
+					"delta":         map[string]interface{}{},
+					"finish_reason": "error",
+				}},
+			}
+			errData, _ := json.Marshal(errChunk)
+			fmt.Fprintf(w, "data: %s\n\n", string(errData))
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
 			h.recordFailureWithDetails("openai", model, account.ID, apiKeyID, err)
 			return
 		}
@@ -2007,6 +2046,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
@@ -2054,7 +2094,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
 		if account == nil {
 			break
 		}
@@ -2112,6 +2152,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
@@ -3956,7 +3997,7 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		}
 
 		// 如果是 403/401，说明 token 无效，尝试刷新后重试
-		if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") || strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
+		if shouldRetryAccountRefreshOnError(errMsg) {
 			if refreshErr := refreshTokenIfNeeded(); refreshErr == nil {
 				// 重试
 				info, err = RefreshAccountInfo(account)

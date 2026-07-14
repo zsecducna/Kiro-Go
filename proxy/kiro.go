@@ -5,6 +5,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
@@ -288,6 +289,29 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	return result
 }
 
+// upstreamError builds a classifiable error from a non-200 Kiro response.
+// 402 is tagged "overage" so the failover layer routes it to overage handling
+// (disableAccountOverage → refresh OverageStatus) instead of falling through to
+// the generic RecordError path. All other codes produce "HTTP <code> ...", which
+// pool.IsAuthFailure reads via its digit-boundary status-token matcher.
+func upstreamError(statusCode int, endpoint, body string) error {
+	if statusCode == 402 {
+		return fmt.Errorf("HTTP 402 overage from %s: %s", endpoint, body)
+	}
+	return fmt.Errorf("HTTP %d from %s: %s", statusCode, endpoint, body)
+}
+
+// parseAndStream wraps parseEventStream so CallKiroAPI's 200 path can defer the
+// upstream body close (closing even on a callback panic, so the TCP connection
+// is returned to the transport pool instead of leaking). Without the defer, a
+// panic in OnText/OnToolUse/parseEventStream unwinds past a plain Close and
+// leaks the connection (repeated panics exhaust MaxIdleConnsPerHost=20 / FDs;
+// net/http's per-request recover catches the panic but the body stays open).
+func parseAndStream(body io.ReadCloser, callback *KiroStreamCallback) error {
+	defer body.Close()
+	return parseEventStream(body, callback)
+}
+
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	originalProfileArn := ""
@@ -384,8 +408,10 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-			// Authentication errors and payment errors are not retried across endpoints.
+			lastErr = upstreamError(resp.StatusCode, ep.Name, string(errBody))
+			// Auth failures (401/403) and overage (402) are account-level: do not
+			// retry across endpoints. Other status codes fall through to the next
+			// endpoint.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr
 			}
@@ -393,9 +419,10 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
-		resp.Body.Close()
-		return err
+		// parseAndStream defers resp.Body.Close(), so a panic in a streaming
+		// callback (OnText/OnToolUse/parseEventStream) still returns the upstream
+		// TCP connection to the transport pool instead of leaking it.
+		return parseAndStream(resp.Body, callback)
 	}
 
 	if lastErr != nil {
@@ -412,6 +439,21 @@ func accountEmailForLog(account *config.Account) string {
 }
 
 // ==================== Event Stream Parsing ====================
+
+// maxEventStreamMessageBytes caps a single AWS event-stream message's total
+// length before parseEventStream allocates a buffer for it. Real Kiro/AWS
+// event-stream messages are small (text deltas + tool JSON, low KB); a corrupt
+// or malicious 32-bit totalLength near 2^32 would otherwise drive a multi-GB
+// make([]byte, …) (alloc-panic under net/http's recover → connection dropped
+// with no terminal event → client hang) or hold a multi-GB buffer to the
+// 5-minute client timeout (memory-pressure DoS). 16 MiB is a generous ceiling.
+const maxEventStreamMessageBytes = 16 * 1024 * 1024
+
+// errEventStreamFrameTooLarge is returned by parseEventStream when a frame's
+// totalLength exceeds maxEventStreamMessageBytes, so the caller (CallKiroAPI)
+// funnels it into the upstream-error / response.failed path instead of
+// allocating gigabytes.
+var errEventStreamFrameTooLarge = errors.New("event-stream: frame totalLength exceeds maximum")
 
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
@@ -442,6 +484,16 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 
 		if totalLength < 16 {
 			continue
+		}
+		// Reject a corrupt/malicious totalLength before the multi-GB make — a
+		// single bit-flip in this 32-bit field would otherwise drive
+		// make([]byte, ~4GB) (alloc-panic under net/http's per-request recover →
+		// no terminal event → client hang) or hold a multi-GB buffer to the 5-min
+		// client timeout (memory-pressure DoS). Returning an error here funnels
+		// the corrupt frame into the upstream-error / response.failed path
+		// instead of allocating gigabytes.
+		if totalLength > maxEventStreamMessageBytes {
+			return errEventStreamFrameTooLarge
 		}
 
 		// Read the remaining message bytes.

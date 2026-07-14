@@ -3,6 +3,7 @@ package proxy
 import (
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"strings"
 	"time"
 )
@@ -10,13 +11,19 @@ import (
 const maxAccountRetryAttempts = 3
 
 func isQuotaErrorMessage(msg string) bool {
-	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "429") || strings.Contains(msg, "quota")
+	lower := strings.ToLower(msg)
+	// Match the 429 status code only as a digit-boundary token (parity with
+	// pool.HasStatusToken used by the auth classifier) so a stray "429" inside
+	// an upstream body token/ID can't false-trigger RecordError(true). "quota"
+	// remains a word marker.
+	return pool.HasStatusToken(lower, "429") || strings.Contains(lower, "quota")
 }
 
 func isOverageErrorMessage(msg string) bool {
-	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "402") && strings.Contains(msg, "overage")
+	lower := strings.ToLower(msg)
+	// 402 must be a digit-boundary token, not an arbitrary substring (parity
+	// with pool.HasStatusToken), ANDed with the "overage" word marker.
+	return pool.HasStatusToken(lower, "402") && strings.Contains(lower, "overage")
 }
 
 func isSuspensionErrorMessage(msg string) bool {
@@ -31,18 +38,17 @@ func isProfileUnavailableErrorMessage(msg string) bool {
 	return strings.Contains(msg, "no available kiro profile")
 }
 
-func isAuthErrorMessage(msg string) bool {
-	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "http 401") ||
-		strings.Contains(msg, "http 403") ||
-		strings.Contains(msg, "unauthorized") ||
-		strings.Contains(msg, "forbidden") ||
-		strings.Contains(msg, "authentication failed") ||
-		strings.Contains(msg, "token invalid") ||
-		strings.Contains(msg, "token expired") ||
-		strings.Contains(msg, "invalid_grant") ||
-		strings.Contains(msg, "access token expired") ||
-		strings.Contains(msg, "refresh token expired")
+// shouldRetryAccountRefreshOnError reports whether a RefreshAccountInfo error
+// looks like a stale/invalid token worth one token-refresh + retry in the admin
+// "refresh account" endpoint (handler.go). This is a RETRY trigger, NOT a ban
+// classifier — a false positive only costs a redundant refresh + retry. Status
+// codes 401/403 are matched by digit boundary (pool.HasStatusToken) for parity
+// with the ban classifiers, so a stray digit in a request ID/token can't fire a
+// spurious refresh+retry; "invalid"/"expired" remain word markers.
+func shouldRetryAccountRefreshOnError(msg string) bool {
+	lower := strings.ToLower(msg)
+	return pool.HasStatusToken(lower, "401") || pool.HasStatusToken(lower, "403") ||
+		strings.Contains(lower, "invalid") || strings.Contains(lower, "expired")
 }
 
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {
@@ -107,7 +113,7 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		// Treat as a soft failure: short cooldown so the next request rotates account,
 		// but never auto-disable — operators can still investigate via warn logs.
 		h.pool.RecordError(account.ID, false)
-	case isAuthErrorMessage(errMsg):
+	case pool.IsAuthFailure(err):
 		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
 	default:
 		h.pool.RecordError(account.ID, false)

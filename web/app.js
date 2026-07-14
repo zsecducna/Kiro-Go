@@ -23,6 +23,10 @@
   let builderIdPollTimer = null;
   let kiroSsoSession = '';
   let kiroSsoPollTimer = null;
+  // Synchronous re-entrancy guard for startKiroSsoLogin: kiroSsoSession is only
+  // assigned AFTER the slow /start round-trip resolves, so a second click during
+  // that window would fire a second POST /start and orphan the first session.
+  let kiroSsoStarting = false;
   let iamSession = '';
   let exportSelectedIds = new Set();
   let currentVersion = '';
@@ -2673,26 +2677,42 @@
     });
   }
   async function startKiroSsoLogin() {
-    // No region prompt: the data-plane region is derived from the profile ARN
-    // returned by SSO (social) or discovered via the cross-region profile probe
-    // (external_idp / Azure), so the operator never has to know it up front.
-    const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify({}) });
-    const d = await res.json();
-    if (d.sessionId && d.signInUrl) {
-      kiroSsoSession = d.sessionId;
-      $('kiroSsoSignInUrl').textContent = d.signInUrl;
-      $('kiroSsoStep1').classList.add('hidden');
-      $('kiroSsoStep2').classList.remove('hidden');
-      $('kiroSsoOpenBtn').addEventListener('click', () => window.open($('kiroSsoSignInUrl').textContent, '_blank'));
-      $('kiroSsoCopyBtn').addEventListener('click', async () => {
-        await copyText($('kiroSsoSignInUrl').textContent);
-        toast(t('common.copied'), 'primary');
-      });
-      $('kiroSsoCancelBtn').addEventListener('click', cancelKiroSsoLogin);
-      // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
-      window.open(d.signInUrl, '_blank');
-      pollKiroSso(d.interval || 2);
-    } else toastError(t('common.failed') + ': ' + (d.error || ''));
+    // Re-entrancy guard: kiroSsoSession is assigned only AFTER the slow /start
+    // round-trip resolves (below), so a second click during that window would
+    // fire a second POST /start and orphan the first session. Set a synchronous
+    // sentinel BEFORE the first await and disable the button.
+    if (kiroSsoStarting) return;
+    kiroSsoStarting = true;
+    const startBtn = $('startKiroSsoBtn');
+    if (startBtn) startBtn.disabled = true;
+    try {
+      // No region prompt: the data-plane region is derived from the profile ARN
+      // returned by SSO (social) or discovered via the cross-region profile probe
+      // (external_idp / Azure), so the operator never has to know it up front.
+      const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify({}) });
+      const d = await res.json();
+      if (d.sessionId && d.signInUrl) {
+        kiroSsoSession = d.sessionId;
+        $('kiroSsoSignInUrl').textContent = d.signInUrl;
+        $('kiroSsoStep1').classList.add('hidden');
+        $('kiroSsoStep2').classList.remove('hidden');
+        $('kiroSsoOpenBtn').addEventListener('click', () => window.open($('kiroSsoSignInUrl').textContent, '_blank'));
+        $('kiroSsoCopyBtn').addEventListener('click', async () => {
+          await copyText($('kiroSsoSignInUrl').textContent);
+          toast(t('common.copied'), 'primary');
+        });
+        $('kiroSsoCancelBtn').addEventListener('click', cancelKiroSsoLogin);
+        // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
+        window.open(d.signInUrl, '_blank');
+        pollKiroSso(d.interval || 2);
+      } else toastError(t('common.failed') + ': ' + (d.error || ''));
+    } finally {
+      // Reset the sentinel so the operator can retry on failure, or start a fresh
+      // flow after a successful one completes. On success step1 is hidden (button
+      // gone), so re-enabling a stale reference is harmless.
+      kiroSsoStarting = false;
+      if (startBtn) startBtn.disabled = false;
+    }
   }
   function pollKiroSso(interval) {
     kiroSsoPollTimer = setTimeout(async () => {

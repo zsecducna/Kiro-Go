@@ -2,12 +2,16 @@ package proxy
 
 import (
 	"bytes"
+	"container/list"
 	"crypto/sha256"
 	"encoding/json"
+	"kiro-go/config"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,22 +54,130 @@ func minCacheableTokensForModel(model string) int {
 type promptCacheEntry struct {
 	ExpiresAt time.Time
 	TTL       time.Duration
+	lruElem   *list.Element // back-ref into t.order; Value = fingerprint [32]byte
 }
 
 type promptCacheTracker struct {
-	mu               sync.Mutex
-	entriesByAccount map[string]map[[32]byte]promptCacheEntry
-	maxSupportedTTL  time.Duration
+	mu              sync.Mutex
+	entries         map[[32]byte]*promptCacheEntry
+	order           *list.List // front = most-recently-used; Element.Value = [32]byte fingerprint
+	maxEntries      int
+	maxSupportedTTL time.Duration
+	hits            int64 // atomic — Compute calls returning CacheReadInputTokens > 0
+	misses          int64 // atomic — Compute calls returning CacheReadInputTokens == 0
+	evictions       int64 // atomic — LRU pop-backs in evictOverflowLocked
+	expirations     int64 // atomic — TTL removals in pruneExpiredLocked
+	dirty           bool
+	stopChan        chan struct{}
+	stopOnce        sync.Once
 }
 
 func newPromptCacheTracker(maxTTL time.Duration) *promptCacheTracker {
+	return newPromptCacheTrackerWithCapacity(maxTTL, config.GetPromptCacheMaxEntries())
+}
+
+func newPromptCacheTrackerWithCapacity(maxTTL time.Duration, maxEntries int) *promptCacheTracker {
 	if maxTTL <= 0 {
 		maxTTL = defaultPromptCacheTTL
 	}
 	return &promptCacheTracker{
-		entriesByAccount: make(map[string]map[[32]byte]promptCacheEntry),
-		maxSupportedTTL:  maxTTL,
+		entries:         make(map[[32]byte]*promptCacheEntry),
+		order:           list.New(),
+		maxEntries:      maxEntries,
+		maxSupportedTTL: maxTTL,
 	}
+}
+
+// on-disk format for prompt-cache persistence (C3).
+type promptCacheEntryOnDisk struct {
+	Fingerprint [32]byte
+	ExpiresAt   int64 // unix seconds
+	TTLSeconds  int64
+}
+
+// Load reads persisted cache entries from path. Entries already expired (by the
+// time load finishes) are dropped. Best-effort: a corrupt/missing file is not
+// fatal — the tracker starts empty, same as the pre-C3 behavior.
+func (t *promptCacheTracker) Load(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // missing file = fresh start (normal on first run)
+	}
+	var disk struct {
+		Version int                      `json:"version"`
+		Entries []promptCacheEntryOnDisk `json:"entries"`
+	}
+	if json.Unmarshal(data, &disk) != nil {
+		return // corrupt = fresh start
+	}
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, e := range disk.Entries {
+		exp := time.Unix(e.ExpiresAt, 0)
+		if !exp.After(now) {
+			continue // already expired
+		}
+		t.putLocked(e.Fingerprint, exp, time.Duration(e.TTLSeconds)*time.Second)
+	}
+}
+
+// startSaveLoop launches a background goroutine that flushes the cache to path
+// every flushInterval (if dirty). Call once after Load. The goroutine exits when
+// stopChan is closed.
+func (t *promptCacheTracker) startSaveLoop(path string, flushInterval time.Duration) {
+	t.stopChan = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(flushInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				t.flush(path)
+			case <-t.stopChan:
+				t.flush(path) // final flush
+				return
+			}
+		}
+	}()
+}
+
+func (t *promptCacheTracker) Stop() {
+	// Idempotent: a second Stop (e.g. test cleanup + main shutdown) would
+	// otherwise close an already-closed channel and panic.
+	t.stopOnce.Do(func() {
+		if t.stopChan != nil {
+			close(t.stopChan)
+		}
+	})
+}
+
+func (t *promptCacheTracker) flush(path string) {
+	t.mu.Lock()
+	if !t.dirty {
+		t.mu.Unlock()
+		return
+	}
+	now := time.Now()
+	entries := make([]promptCacheEntryOnDisk, 0, len(t.entries))
+	for fp, e := range t.entries {
+		if !e.ExpiresAt.After(now) {
+			continue
+		}
+		entries = append(entries, promptCacheEntryOnDisk{
+			Fingerprint: fp,
+			ExpiresAt:   e.ExpiresAt.Unix(),
+			TTLSeconds:  int64(e.TTL.Seconds()),
+		})
+	}
+	t.dirty = false
+	t.mu.Unlock()
+
+	data, _ := json.MarshalIndent(map[string]interface{}{
+		"version": 1,
+		"entries": entries,
+	}, "", "  ")
+	_ = os.WriteFile(path, data, 0600)
 }
 
 func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTokens int) *promptCacheProfile {
@@ -125,10 +237,17 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 }
 
-func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) promptCacheUsage {
+func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) (u promptCacheUsage) {
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
 		return promptCacheUsage{}
 	}
+	defer func() {
+		if u.CacheReadInputTokens > 0 {
+			atomic.AddInt64(&t.hits, 1)
+		} else {
+			atomic.AddInt64(&t.misses, 1)
+		}
+	}()
 
 	minTokens := minCacheableTokensForModel(profile.Model)
 	last := profile.Breakpoints[len(profile.Breakpoints)-1]
@@ -139,14 +258,14 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	defer t.mu.Unlock()
 	t.pruneExpiredLocked(now)
 
-	entries := t.entriesByAccount[accountID]
-	if len(entries) == 0 {
+	if len(t.entries) == 0 {
 		// First request for this account: report creation only if above threshold.
 		effectiveCreation := lastTokens
 		if effectiveCreation < minTokens {
 			effectiveCreation = 0
 		}
 		cache5m, cache1h := computePromptCacheTTLBreakdown(profile, 0)
+		cache5m, cache1h = clampCacheBreakdownToCreation(cache5m, cache1h, effectiveCreation)
 		return promptCacheUsage{
 			CacheCreationInputTokens:   effectiveCreation,
 			CacheReadInputTokens:       0,
@@ -158,7 +277,7 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	// Cap cacheable tokens at 85% of total input to ensure a realistic
 	// uncached portion. The newest content in a request is never fully
 	// served from cache on the current turn.
-	maxCacheable := int(float64(profile.TotalInputTokens) * 0.85)
+	maxCacheable := int(float64(profile.TotalInputTokens) * config.GetPromptCacheMaxRatio())
 	if lastTokens > maxCacheable {
 		lastTokens = maxCacheable
 	}
@@ -170,12 +289,13 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 		if breakpoint.CumulativeTokens < minTokens {
 			continue
 		}
-		entry, ok := entries[breakpoint.Fingerprint]
+		entry, ok := t.entries[breakpoint.Fingerprint]
 		if !ok || entry.ExpiresAt.Before(now) {
 			continue
 		}
 		entry.ExpiresAt = now.Add(entry.TTL)
-		entries[breakpoint.Fingerprint] = entry
+		t.order.MoveToFront(entry.lruElem)
+		t.dirty = true // hit extends TTL — persist so a flush before the next Update doesn't lose it
 		matchedTokens = minInt(breakpoint.CumulativeTokens, profile.TotalInputTokens)
 		if matchedTokens > lastTokens {
 			matchedTokens = lastTokens
@@ -185,6 +305,7 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 
 	creation := maxInt(lastTokens-matchedTokens, 0)
 	cache5m, cache1h := computePromptCacheTTLBreakdown(profile, matchedTokens)
+	cache5m, cache1h = clampCacheBreakdownToCreation(cache5m, cache1h, creation)
 	return promptCacheUsage{
 		CacheCreationInputTokens:   creation,
 		CacheReadInputTokens:       matchedTokens,
@@ -204,34 +325,128 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 	defer t.mu.Unlock()
 	t.pruneExpiredLocked(now)
 
-	entries := t.entriesByAccount[accountID]
-	if entries == nil {
-		entries = make(map[[32]byte]promptCacheEntry)
-		t.entriesByAccount[accountID] = entries
-	}
-
+	// entries is the global map now (C1: cross-account sharing).
 	for _, breakpoint := range profile.Breakpoints {
 		// Skip breakpoints below the minimum cacheable token threshold.
 		if breakpoint.CumulativeTokens < minTokens {
 			continue
 		}
-		entries[breakpoint.Fingerprint] = promptCacheEntry{
-			ExpiresAt: now.Add(breakpoint.TTL),
-			TTL:       breakpoint.TTL,
+		t.putLocked(breakpoint.Fingerprint, now.Add(breakpoint.TTL), breakpoint.TTL)
+	}
+	t.dirty = true
+	t.evictOverflowLocked()
+}
+
+func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
+	for fingerprint, entry := range t.entries {
+		if !entry.ExpiresAt.After(now) {
+			t.order.Remove(entry.lruElem)
+			delete(t.entries, fingerprint)
+			atomic.AddInt64(&t.expirations, 1)
 		}
 	}
 }
 
-func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
-	for accountID, entries := range t.entriesByAccount {
-		for fingerprint, entry := range entries {
-			if !entry.ExpiresAt.After(now) {
-				delete(entries, fingerprint)
-			}
+// putLocked inserts a fingerprint or refreshes its existing entry, marking it
+// most-recently-used. Caller holds t.mu.
+func (t *promptCacheTracker) putLocked(fp [32]byte, expiresAt time.Time, ttl time.Duration) {
+	if e, ok := t.entries[fp]; ok {
+		e.ExpiresAt = expiresAt
+		e.TTL = ttl
+		t.order.MoveToFront(e.lruElem)
+		return
+	}
+	elem := t.order.PushFront(fp)
+	t.entries[fp] = &promptCacheEntry{ExpiresAt: expiresAt, TTL: ttl, lruElem: elem}
+}
+
+// evictOverflowLocked bounds the entries map to maxEntries by evicting the
+// least-recently-used entries (the back of the order list). O(1) per eviction.
+// Caller holds t.mu.
+func (t *promptCacheTracker) evictOverflowLocked() {
+	for len(t.entries) > t.maxEntries {
+		back := t.order.Back()
+		if back == nil {
+			return
 		}
-		if len(entries) == 0 {
-			delete(t.entriesByAccount, accountID)
+		fp := back.Value.([32]byte)
+		t.order.Remove(back)
+		delete(t.entries, fp)
+		atomic.AddInt64(&t.evictions, 1)
+	}
+}
+
+// PromptCacheStats is a point-in-time snapshot of cache counters, surfaced via
+// /v1/stats. All counters are cumulative since tracker construction.
+type PromptCacheStats struct {
+	Entries     int   `json:"entries"`
+	Capacity    int   `json:"capacity"`
+	Hits        int64 `json:"hits"`
+	Misses      int64 `json:"misses"`
+	Evictions   int64 `json:"evictions"`
+	Expirations int64 `json:"expirations"`
+}
+
+func (t *promptCacheTracker) Stats() PromptCacheStats {
+	if t == nil {
+		return PromptCacheStats{}
+	}
+	t.mu.Lock()
+	entries := len(t.entries)
+	capacity := t.maxEntries
+	t.mu.Unlock()
+	return PromptCacheStats{
+		Entries:     entries,
+		Capacity:    capacity,
+		Hits:        atomic.LoadInt64(&t.hits),
+		Misses:      atomic.LoadInt64(&t.misses),
+		Evictions:   atomic.LoadInt64(&t.evictions),
+		Expirations: atomic.LoadInt64(&t.expirations),
+	}
+}
+
+// splitAgainstTotal rescales an estimate-domain cache split onto a real input
+// total, preserving input + creation + read == realTotal. The cache-covered
+// fraction of the prompt (in estimate units) is applied to realTotal, then
+// divided into read vs creation by their estimate-domain ratio; the 5m/1h
+// breakdown is scaled to the new creation total.
+func (u promptCacheUsage) splitAgainstTotal(estTotal, realTotal int) promptCacheUsage {
+	if realTotal <= 0 {
+		return u
+	}
+	coveredEst := u.CacheCreationInputTokens + u.CacheReadInputTokens
+	if coveredEst <= 0 || estTotal <= 0 {
+		return promptCacheUsage{} // no cache coverage → all fresh input
+	}
+	ratio := float64(coveredEst) / float64(estTotal)
+	if ratio > 1 {
+		ratio = 1
+	}
+	cacheTotal := int(float64(realTotal)*ratio + 0.5)
+	if cacheTotal > realTotal {
+		cacheTotal = realTotal
+	}
+	read := int(float64(cacheTotal)*float64(u.CacheReadInputTokens)/float64(coveredEst) + 0.5)
+	if read > cacheTotal {
+		read = cacheTotal
+	}
+	if read < 0 {
+		read = 0
+	}
+	creation := cacheTotal - read
+	cache5m, cache1h := creation, 0
+	if u.CacheCreationInputTokens > 0 {
+		cache1h = int(float64(u.CacheCreation1hInputTokens)*float64(creation)/float64(u.CacheCreationInputTokens) + 0.5)
+		if cache1h > creation {
+			cache1h = creation
 		}
+		cache5m = creation - cache1h
+	}
+	return promptCacheUsage{
+		CacheCreationInputTokens:   creation,
+		CacheReadInputTokens:       read,
+		CacheCreation5mInputTokens: cache5m,
+		CacheCreation1hInputTokens: cache1h,
 	}
 }
 
@@ -504,6 +719,26 @@ func computePromptCacheTTLBreakdown(profile *promptCacheProfile, matchedTokens i
 		previous = current
 	}
 	return cache5m, cache1h
+}
+
+// clampCacheBreakdownToCreation scales the 5m/1h cache-creation split down to
+// creation when the raw breakpoint deltas (uncapped by the 0.85 cacheable ratio)
+// exceed it, preserving the 1h:5m ratio. Guarantees the Anthropic invariant
+// cache_creation_input_tokens == ephemeral_5m + ephemeral_1h.
+func clampCacheBreakdownToCreation(cache5m, cache1h, creation int) (int, int) {
+	total := cache5m + cache1h
+	if total <= creation || total <= 0 {
+		return cache5m, cache1h
+	}
+	scale := float64(creation) / float64(total)
+	one := int(float64(cache1h)*scale + 0.5)
+	if one > creation {
+		one = creation
+	}
+	if one < 0 {
+		one = 0
+	}
+	return creation - one, one
 }
 
 func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {

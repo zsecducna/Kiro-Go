@@ -11,6 +11,28 @@ import (
 	"time"
 )
 
+func TestHandleModelsCodexCatalogShape(t *testing.T) {
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.144.1", nil)
+	rec := httptest.NewRecorder()
+
+	h.handleModels(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, ok := body["models"]; !ok {
+		t.Fatalf("expected Codex models field, got %s", rec.Body.String())
+	}
+	if _, ok := body["data"]; ok {
+		t.Fatalf("Codex catalog response must not use OpenAI data field: %s", rec.Body.String())
+	}
+}
+
 func TestThinkingSourceReasoningFirst(t *testing.T) {
 	var source thinkingStreamSource
 

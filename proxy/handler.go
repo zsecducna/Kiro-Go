@@ -514,6 +514,18 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 
 // handleModels 模型列表
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
+	// Codex fetches a provider-owned catalog with ?client_version= and expects
+	// its own {"models": [...]} schema rather than the OpenAI {"data": [...]}
+	// shape. An empty catalog is valid and makes Codex keep its bundled model
+	// metadata for explicitly configured custom model IDs.
+	if r.URL.Query().Get("client_version") != "" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"models": []interface{}{},
+		})
+		return
+	}
+
 	// 尝试用缓存的真实模型列表
 	h.modelsCacheMu.RLock()
 	cached := h.cachedModels

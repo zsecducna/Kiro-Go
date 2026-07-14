@@ -42,6 +42,72 @@ func parseResponsesInput(raw json.RawMessage) ([]OpenAIMessage, error) {
 	return nil, fmt.Errorf("unsupported input shape")
 }
 
+// extractResponsesInputTools reads the additional_tools item emitted by Codex
+// Desktop. Recent Codex clients place their per-session tool declarations in
+// the Responses API input array instead of the top-level tools field.
+func extractResponsesInputTools(raw json.RawMessage) ([]OpenAITool, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" || trimmed[0] == '"' {
+		return nil, nil
+	}
+
+	var items []json.RawMessage
+	switch trimmed[0] {
+	case '[':
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return nil, fmt.Errorf("invalid input array: %w", err)
+		}
+	case '{':
+		items = []json.RawMessage{raw}
+	default:
+		return nil, nil
+	}
+
+	var tools []OpenAITool
+	for _, item := range items {
+		var envelope struct {
+			Type  string       `json:"type"`
+			Tools []OpenAITool `json:"tools"`
+		}
+		if err := json.Unmarshal(item, &envelope); err != nil {
+			continue
+		}
+		if envelope.Type == "additional_tools" {
+			tools = append(tools, envelope.Tools...)
+		}
+	}
+	return tools, nil
+}
+
+func mergeResponsesTools(primary, additional []OpenAITool) []OpenAITool {
+	if len(additional) == 0 {
+		return primary
+	}
+
+	merged := make([]OpenAITool, 0, len(primary)+len(additional))
+	seen := make(map[string]bool, len(primary)+len(additional))
+	appendUnique := func(tool OpenAITool) {
+		key := strings.ToLower(strings.TrimSpace(tool.Type)) + "\x00" +
+			strings.ToLower(strings.TrimSpace(tool.Function.Name))
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		merged = append(merged, tool)
+	}
+	for _, tool := range primary {
+		appendUnique(tool)
+	}
+	for _, tool := range additional {
+		appendUnique(tool)
+	}
+	return merged
+}
+
 func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error) {
 	messages := make([]OpenAIMessage, 0, len(items))
 	pendingUserParts := []interface{}{}

@@ -96,6 +96,35 @@ func TestResponsesParseCustomToolRoundTrip(t *testing.T) {
 	}
 }
 
+func TestResponsesExtractAdditionalTools(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"additional_tools","role":"developer","tools":[
+			{"type":"custom","name":"exec","description":"Run terminal JavaScript"},
+			{"type":"function","name":"wait","description":"Wait for execution","parameters":{"type":"object"}}
+		]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"run pwd"}]}
+	]`)
+
+	tools, err := extractResponsesInputTools(raw)
+	if err != nil {
+		t.Fatalf("extract additional tools: %v", err)
+	}
+	if len(tools) != 2 {
+		t.Fatalf("expected two additional tools, got %d (%+v)", len(tools), tools)
+	}
+	if tools[0].Type != "custom" || tools[0].Function.Name != "exec" {
+		t.Fatalf("unexpected custom tool: %+v", tools[0])
+	}
+	if tools[1].Type != "function" || tools[1].Function.Name != "wait" {
+		t.Fatalf("unexpected function tool: %+v", tools[1])
+	}
+
+	merged := mergeResponsesTools(tools[:1], tools)
+	if len(merged) != 2 {
+		t.Fatalf("expected duplicate exec tool to be removed, got %d", len(merged))
+	}
+}
+
 func TestResponsesStoreAndLoad(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(cfgFile); err != nil {
@@ -482,6 +511,61 @@ func TestResponsesNonStreamCustomToolCall(t *testing.T) {
 	}
 	if call.Arguments != "" {
 		t.Fatalf("custom call must not expose function arguments: %+v", call)
+	}
+}
+
+func TestResponsesCodexAdditionalToolsRoundTrip(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	var upstreamPayload string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		upstreamPayload = string(body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "call_exec_codex",
+			"name":      "exec",
+			"input":     `{"input":"const r = await tools.exec_command({cmd:\"pwd\"}); text(r.output);"}`,
+			"stop":      true,
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	body := strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"store":false,
+		"input":[
+			{"type":"additional_tools","role":"developer","tools":[{
+				"type":"custom",
+				"name":"exec",
+				"description":"Run JavaScript that orchestrates terminal tools",
+				"format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}
+			}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"run pwd"}]}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", body)
+	rec := httptest.NewRecorder()
+
+	h.handleOpenAIResponses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(upstreamPayload, `"name":"exec"`) ||
+		!strings.Contains(upstreamPayload, `"required":["input"]`) {
+		t.Fatalf("Codex additional tool was not bridged to Kiro schema: %s", upstreamPayload)
+	}
+
+	var resp ResponsesObject
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
+	}
+	if len(resp.Output) != 1 || resp.Output[0].Type != "custom_tool_call" ||
+		resp.Output[0].Name != "exec" {
+		t.Fatalf("unexpected Codex custom tool response: %+v", resp.Output)
 	}
 }
 

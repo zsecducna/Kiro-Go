@@ -57,6 +57,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		h.sendOpenAIError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
+	inputTools, err := extractResponsesInputTools(req.Input)
+	if err != nil {
+		h.sendOpenAIError(w, 400, "invalid_request_error", err.Error())
+		return
+	}
+	req.Tools = mergeResponsesTools(req.Tools, inputTools)
 
 	finalMessages := make([]OpenAIMessage, 0, len(historyMessages)+len(inputMessages)+1)
 	finalMessages = append(finalMessages, historyMessages...)

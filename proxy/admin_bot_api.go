@@ -19,6 +19,7 @@ import (
 // password that guards the /admin panel), never with customer API keys:
 //
 //	POST /admin/new_api_key      — mint a customer API key with a credit quota
+//	POST /admin/delete_api_key   — delete a customer API key (by id or key value)
 //	POST /admin/stats            — per-key usage stats, optionally filtered
 //	GET  /admin/pool             — pool credit accounting (available vs sold)
 //	POST /admin/add_kiro_api_key — add a Kiro API key (ksk_) account to the pool
@@ -108,6 +109,75 @@ func (h *Handler) handleAdminNewApiKey(w http.ResponseWriter, r *http.Request) {
 		"key":     entry.Key, // cleartext, shown once — the bot forwards this to the buyer
 		"name":    entry.Name,
 		"credits": entry.CreditLimit,
+	})
+}
+
+// adminDeleteApiKeyRequest is the body for POST /admin/delete_api_key. Identify the
+// key by its entry id or by its full cleartext value; at least one is required.
+type adminDeleteApiKeyRequest struct {
+	ID     string `json:"id,omitempty"`     // Key entry UUID
+	ApiKey string `json:"apiKey,omitempty"` // Full cleartext key value (sk-...)
+}
+
+// handleAdminDeleteApiKey POST /admin/delete_api_key — permanently delete a customer
+// API key so it can no longer authenticate. The bot uses this to revoke a sold key
+// (refund, abuse, expiry). Accepts the entry id or the cleartext key value; returns
+// 404 when no such key exists so a caller can tell "deleted" from "never existed".
+func (h *Handler) handleAdminDeleteApiKey(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	var req adminDeleteApiKeyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	req.ApiKey = strings.TrimSpace(req.ApiKey)
+	if req.ID == "" && req.ApiKey == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "id or apiKey is required"})
+		return
+	}
+
+	// Resolve the target entry id. When only the cleartext key is given, look it up.
+	id := req.ID
+	if id == "" {
+		entry := config.FindApiKeyByValue(req.ApiKey)
+		if entry == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "API key not found"})
+			return
+		}
+		id = entry.ID
+	} else {
+		// If both id and apiKey are supplied, they must name the same entry — reject a
+		// contradictory pair rather than silently trusting id and deleting the wrong key.
+		if req.ApiKey != "" {
+			if byValue := config.FindApiKeyByValue(req.ApiKey); byValue == nil || byValue.ID != id {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "id and apiKey refer to different keys"})
+				return
+			}
+		}
+		// DeleteApiKey is idempotent (nil on unknown id); check first so we can return
+		// an honest 404 instead of a false success.
+		if config.GetApiKeyEntry(id) == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "API key not found"})
+			return
+		}
+	}
+
+	if err := config.DeleteApiKey(id); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"id":      id,
 	})
 }
 

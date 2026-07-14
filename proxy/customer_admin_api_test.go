@@ -249,6 +249,62 @@ func TestAdminNewApiKeyMintsQuotaKey(t *testing.T) {
 	}
 }
 
+func TestAdminDeleteApiKey(t *testing.T) {
+	mustInitConfig(t)
+	config.SetPassword("topsecret")
+	h := &Handler{}
+
+	// Missing selector → 400.
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/delete_api_key", `{}`, "topsecret")); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no id/apiKey, got %d", rec.Code)
+	}
+	// Unknown id → 404.
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/delete_api_key", `{"id":"nope"}`, "topsecret")); rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown id, got %d", rec.Code)
+	}
+	// Wrong admin key → 401.
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/delete_api_key", `{"id":"x"}`, "wrong")); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with wrong admin key, got %d", rec.Code)
+	}
+
+	// Delete by id.
+	a := seedKey(t, "byid", 100, 0)
+	rec := serve(h, adminReq(http.MethodPost, "/admin/delete_api_key", `{"id":"`+a.ID+`"}`, "topsecret"))
+	if rec.Code != http.StatusOK || decodeBody(t, rec)["id"] != a.ID {
+		t.Fatalf("delete by id failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if config.GetApiKeyEntry(a.ID) != nil {
+		t.Fatal("key still present after delete-by-id")
+	}
+
+	// Delete by cleartext value.
+	b := seedKey(t, "byvalue", 100, 0)
+	rec = serve(h, adminReq(http.MethodPost, "/admin/delete_api_key", `{"apiKey":"`+b.Key+`"}`, "topsecret"))
+	if rec.Code != http.StatusOK || decodeBody(t, rec)["id"] != b.ID {
+		t.Fatalf("delete by value failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if config.GetApiKeyEntry(b.ID) != nil {
+		t.Fatal("key still present after delete-by-value")
+	}
+
+	// Deleting the same key again → 404 (no false success).
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/delete_api_key", `{"id":"`+b.ID+`"}`, "topsecret")); rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 re-deleting, got %d", rec.Code)
+	}
+
+	// Contradictory id+apiKey (naming different keys) → 400, nothing deleted.
+	c := seedKey(t, "keepC", 100, 0)
+	d := seedKey(t, "keepD", 100, 0)
+	rec = serve(h, adminReq(http.MethodPost, "/admin/delete_api_key",
+		`{"id":"`+c.ID+`","apiKey":"`+d.Key+`"}`, "topsecret"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for mismatched id/apiKey, got %d", rec.Code)
+	}
+	if config.GetApiKeyEntry(c.ID) == nil || config.GetApiKeyEntry(d.ID) == nil {
+		t.Fatal("mismatched request must not delete either key")
+	}
+}
+
 func TestAdminStatsFilters(t *testing.T) {
 	mustInitConfig(t)
 	config.SetPassword("topsecret")

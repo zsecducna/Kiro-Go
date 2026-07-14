@@ -421,6 +421,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleAdminNewApiKey(w, r)
+	case path == "/admin/delete_api_key" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminDeleteApiKey(w, r)
 	case path == "/admin/stats" && r.Method == "POST":
 		if !h.authenticateAdminKey(w, r) {
 			return

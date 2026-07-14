@@ -209,6 +209,52 @@ func ResetApiKeyUsage(id string) error {
 	return errors.New("api key not found")
 }
 
+// RechargeApiKey additively increases an API key's limits (a customer buying
+// more credits for an existing key they want to keep) and re-enables the key
+// when the top-up brings its usage back under all configured limits.
+//
+// Amounts are ADDED, not set: a key sold with 100 credits, exhausted, then
+// recharged by 50 ends with CreditLimit=150 (remaining = 150 - 100 = 50). Usage
+// counters (CreditsUsed/TokensUsed) are preserved so lifetime accounting stays
+// intact — this is the inverse of ResetApiKeyUsage, which the recharge flow
+// intentionally does NOT use (a recharge tops up allowance; it does not wipe the
+// buyer's consumption record).
+//
+// addCredits/addTokens must be >= 0 (validated by the caller); a zero amount
+// leaves that limit untouched. Adding to a currently-unlimited limit (0) turns
+// it metered at the added amount — the bot only recharges metered keys, so this
+// is benign. Re-enable happens only when the key is under limit after the
+// top-up: a partial recharge that still leaves usage over the (also-raised)
+// limit stays disabled. Returns the updated entry.
+func RechargeApiKey(id string, addCredits float64, addTokens int64) (ApiKeyEntry, error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return ApiKeyEntry{}, errors.New("config not initialized")
+	}
+	for i := range cfg.ApiKeys {
+		if cfg.ApiKeys[i].ID == id {
+			if addCredits > 0 {
+				cfg.ApiKeys[i].CreditLimit += addCredits
+			}
+			if addTokens > 0 {
+				cfg.ApiKeys[i].TokenLimit += addTokens
+			}
+			// Re-enable a key auto-deactivated on exhaustion now that the raised
+			// limit puts it back under quota. No-op if already enabled; stays off if
+			// still over limit after a partial top-up.
+			if overToken, overCredit := ApiKeyOverLimit(cfg.ApiKeys[i]); !overToken && !overCredit {
+				cfg.ApiKeys[i].Enabled = true
+			}
+			if err := saveLocked(); err != nil {
+				return ApiKeyEntry{}, err
+			}
+			return cfg.ApiKeys[i], nil
+		}
+	}
+	return ApiKeyEntry{}, errors.New("api key not found")
+}
+
 // GenerateApiKeyValue returns a new random 32-byte hex API key prefixed with "sk-".
 func GenerateApiKeyValue() string {
 	buf := make([]byte, 32)

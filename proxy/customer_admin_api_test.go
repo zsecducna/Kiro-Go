@@ -322,6 +322,99 @@ func TestAdminDeleteApiKey(t *testing.T) {
 	}
 }
 
+func TestAdminRechargeApiKey(t *testing.T) {
+	mustInitConfig(t)
+	config.SetPassword("topsecret")
+	h := &Handler{}
+
+	// Missing selector → 400.
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/recharge_api_key", `{"credits":10}`, "topsecret")); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no id/apiKey, got %d", rec.Code)
+	}
+	// No amount → 400.
+	a0 := seedKey(t, "noamount", 100, 0)
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/recharge_api_key", `{"id":"`+a0.ID+`"}`, "topsecret")); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no credits/tokens, got %d", rec.Code)
+	}
+	// Negative amount → 400.
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/recharge_api_key", `{"id":"`+a0.ID+`","credits":-5}`, "topsecret")); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for negative credits, got %d", rec.Code)
+	}
+	// Unknown id → 404.
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/recharge_api_key", `{"id":"nope","credits":10}`, "topsecret")); rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown id, got %d", rec.Code)
+	}
+	// Wrong admin key → 401.
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/recharge_api_key", `{"id":"x","credits":10}`, "wrong")); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with wrong admin key, got %d", rec.Code)
+	}
+
+	// Core scenario: a key sold with 100 credits, fully consumed (auto-disabled),
+	// recharged by 50 → limit 150, still 100 used, 50 remaining, re-enabled.
+	exhausted := seedKey(t, "exhausted", 100, 100)
+	if exhausted.Enabled {
+		t.Fatal("precondition: key should be auto-disabled after consuming its full quota")
+	}
+	rec := serve(h, adminReq(http.MethodPost, "/admin/recharge_api_key",
+		`{"apiKey":"`+exhausted.Key+`","credits":50}`, "topsecret"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recharge failed: %d %s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["enabled"] != true {
+		t.Fatalf("expected key re-enabled after top-up, got %v", body["enabled"])
+	}
+	if got := body["creditLimit"].(float64); got != 150 {
+		t.Fatalf("expected creditLimit 150, got %v", got)
+	}
+	if got := body["creditsRemaining"].(float64); got != 50 {
+		t.Fatalf("expected creditsRemaining 50, got %v", got)
+	}
+	// Persisted: the key authenticates again and usage history is preserved.
+	stored := config.GetApiKeyEntry(exhausted.ID)
+	if stored == nil || !stored.Enabled || stored.CreditLimit != 150 || stored.CreditsUsed != 100 {
+		t.Fatalf("recharge not persisted correctly: %+v", stored)
+	}
+
+	// Partial recharge (less than the overage) must NOT re-enable: 100 used,
+	// limit raised 100→120 is still under? No — 100 < 120, so it WOULD re-enable.
+	// Construct a genuine still-over case: 200 used against a 100 limit, top up 50
+	// → limit 150 < 200 used, stays disabled.
+	over := seedKey(t, "over", 100, 200)
+	rec = serve(h, adminReq(http.MethodPost, "/admin/recharge_api_key",
+		`{"id":"`+over.ID+`","credits":50}`, "topsecret"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recharge(over) failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if decodeBody(t, rec)["enabled"] != false {
+		t.Fatal("key still over limit after partial top-up must stay disabled")
+	}
+
+	// Recharging credits on an unlimited (limit 0) key → 400, no mutation: adding
+	// to a 0 limit would convert it to metered and could instantly over-limit it.
+	unlimited := seedKey(t, "unlimited", 0, 0)
+	rec = serve(h, adminReq(http.MethodPost, "/admin/recharge_api_key",
+		`{"id":"`+unlimited.ID+`","credits":100}`, "topsecret"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 recharging an unlimited key, got %d %s", rec.Code, rec.Body.String())
+	}
+	if e := config.GetApiKeyEntry(unlimited.ID); e == nil || e.CreditLimit != 0 {
+		t.Fatalf("unlimited key must not be converted to metered: %+v", e)
+	}
+
+	// Contradictory id+apiKey → 400, no top-up applied.
+	c := seedKey(t, "keepC", 100, 0)
+	d := seedKey(t, "keepD", 100, 0)
+	rec = serve(h, adminReq(http.MethodPost, "/admin/recharge_api_key",
+		`{"id":"`+c.ID+`","apiKey":"`+d.Key+`","credits":10}`, "topsecret"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for mismatched id/apiKey, got %d", rec.Code)
+	}
+	if e := config.GetApiKeyEntry(c.ID); e == nil || e.CreditLimit != 100 {
+		t.Fatalf("mismatched request must not recharge: %+v", e)
+	}
+}
+
 func TestAdminStatsFilters(t *testing.T) {
 	mustInitConfig(t)
 	config.SetPassword("topsecret")

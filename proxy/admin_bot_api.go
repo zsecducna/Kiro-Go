@@ -181,6 +181,118 @@ func (h *Handler) handleAdminDeleteApiKey(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// adminRechargeApiKeyRequest is the body for POST /admin/recharge_api_key.
+// Identify the key by entry id or full cleartext value (at least one required),
+// and supply the amount to ADD to its limits. Credits and/or Tokens; at least
+// one must be > 0. Amounts are additive top-ups, never absolute limits.
+type adminRechargeApiKeyRequest struct {
+	ID      string  `json:"id,omitempty"`     // Key entry UUID
+	ApiKey  string  `json:"apiKey,omitempty"` // Full cleartext key value (sk-...)
+	Credits float64 `json:"credits,omitempty"` // Credits to ADD to the key's credit limit
+	Tokens  int64   `json:"tokens,omitempty"`  // Optional tokens to ADD to the token limit
+}
+
+// handleAdminRechargeApiKey POST /admin/recharge_api_key — top up an existing
+// customer key's quota without changing the key value. The bot calls this when a
+// buyer purchases more credits for a key they already own: the credit (and
+// optional token) limit is raised by the requested amount and the key is
+// re-enabled if the top-up brings it back under quota (the exhausted-then-recharged
+// scenario). Usage counters are preserved. Accepts the entry id or the cleartext
+// key value; 404 when no such key exists, 400 on a contradictory id+apiKey pair or
+// a non-positive top-up.
+func (h *Handler) handleAdminRechargeApiKey(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	var req adminRechargeApiKeyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	req.ApiKey = strings.TrimSpace(req.ApiKey)
+	if req.ID == "" && req.ApiKey == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "id or apiKey is required"})
+		return
+	}
+	// Negative amounts would silently reduce a limit (or, for tokens, flip a
+	// metered key toward "unlimited" semantics); reject them. At least one amount
+	// must be a real top-up or the call is a no-op the caller didn't intend.
+	if req.Credits < 0 || req.Tokens < 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "credits and tokens must be >= 0"})
+		return
+	}
+	if req.Credits == 0 && req.Tokens == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "credits or tokens must be > 0"})
+		return
+	}
+
+	// Resolve the target entry id (same rules as delete): look up by value when
+	// only the cleartext key is given; reject a contradictory id+apiKey pair.
+	id := req.ID
+	if id == "" {
+		entry := config.FindApiKeyByValue(req.ApiKey)
+		if entry == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "API key not found"})
+			return
+		}
+		id = entry.ID
+	} else {
+		if req.ApiKey != "" {
+			if byValue := config.FindApiKeyByValue(req.ApiKey); byValue == nil || byValue.ID != id {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "id and apiKey refer to different keys"})
+				return
+			}
+		}
+		if config.GetApiKeyEntry(id) == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "API key not found"})
+			return
+		}
+	}
+
+	// Guard against topping up an unlimited limit (0). Adding to it converts the
+	// key from unlimited to metered, and if the key already has usage above the
+	// added amount it flips to over-limit on the next request — a "recharge" that
+	// silently kills an unlimited key. Recharge only makes sense for metered keys.
+	if current := config.GetApiKeyEntry(id); current != nil {
+		if req.Credits > 0 && current.CreditLimit == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "cannot recharge credits on a key with no credit limit (unlimited)"})
+			return
+		}
+		if req.Tokens > 0 && current.TokenLimit == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "cannot recharge tokens on a key with no token limit (unlimited)"})
+			return
+		}
+	}
+
+	entry, err := config.RechargeApiKey(id, req.Credits, req.Tokens)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":          true,
+		"id":               entry.ID,
+		"enabled":          entry.Enabled,
+		"creditLimit":      entry.CreditLimit,
+		"creditsUsed":      entry.CreditsUsed,
+		"creditsRemaining": creditsRemaining(entry),
+		"tokenLimit":       entry.TokenLimit,
+		"tokensUsed":       entry.TokensUsed,
+		"tokensRemaining":  tokensRemaining(entry),
+	})
+}
+
 // adminStatsRequest is the body for POST /admin/stats. All filters are
 // optional and AND-ed together; an empty body returns every key.
 type adminStatsRequest struct {

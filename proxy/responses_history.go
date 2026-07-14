@@ -1,5 +1,7 @@
 package proxy
 
+import "encoding/json"
+
 // maxResponsesHistoryDepth caps how far back we walk the previous_response_id
 // chain when expanding history. The cap prevents pathological loops in
 // corrupted/cyclic stores from running forever; legitimate chains rarely go
@@ -91,18 +93,19 @@ func outputToMessages(items []ResponseOutputItem) []OpenAIMessage {
 				continue
 			}
 			out = append(out, OpenAIMessage{Role: role, Content: text})
-		case "function_call":
+		case "function_call", "custom_tool_call":
 			tc := ToolCall{ID: item.CallID, Type: "function"}
 			if tc.ID == "" {
 				tc.ID = item.ID
 			}
 			tc.Function.Name = item.Name
-			tc.Function.Arguments = item.Arguments
-			out = append(out, OpenAIMessage{
-				Role:      "assistant",
-				Content:   "",
-				ToolCalls: []ToolCall{tc},
-			})
+			if item.Type == "custom_tool_call" {
+				wrapped, _ := json.Marshal(map[string]string{customToolInputField: item.Input})
+				tc.Function.Arguments = string(wrapped)
+			} else {
+				tc.Function.Arguments = item.Arguments
+			}
+			appendResponsesToolCall(&out, tc)
 		}
 	}
 	return out

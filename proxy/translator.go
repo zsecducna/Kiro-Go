@@ -194,7 +194,10 @@ type ClaudeUsage struct {
 
 // ==================== Claude -> Kiro 转换 ====================
 
-const maxToolDescLen = 10237
+const (
+	maxToolDescLen       = 10237
+	customToolInputField = "input"
+)
 
 func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
@@ -1015,7 +1018,8 @@ type ToolCall struct {
 }
 
 type OpenAITool struct {
-	Type     string `json:"type"`
+	Type     string          `json:"type"`
+	Format   json.RawMessage `json:"format,omitempty"`
 	Function struct {
 		Name        string      `json:"name"`
 		Description string      `json:"description"`
@@ -1037,10 +1041,11 @@ type OpenAITool struct {
 // which Kiro rejects with HTTP 400 "Improperly formed request".
 func (t *OpenAITool) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Type        string      `json:"type"`
-		Name        string      `json:"name"`
-		Description string      `json:"description"`
-		Parameters  interface{} `json:"parameters"`
+		Type        string          `json:"type"`
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Parameters  interface{}     `json:"parameters"`
+		Format      json.RawMessage `json:"format"`
 		Function    *struct {
 			Name        string      `json:"name"`
 			Description string      `json:"description"`
@@ -1052,6 +1057,7 @@ func (t *OpenAITool) UnmarshalJSON(data []byte) error {
 	}
 
 	t.Type = raw.Type
+	t.Format = append(t.Format[:0], raw.Format...)
 	if raw.Function != nil {
 		t.Function.Name = raw.Function.Name
 		t.Function.Description = raw.Function.Description
@@ -1266,10 +1272,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	// 转换工具
-	kiroTools := convertOpenAITools(req.Tools)
+	kiroTools, toolNameMap := convertOpenAIToolsWithNameMap(req.Tools)
 
 	// 构建 payload
 	payload := &KiroPayload{}
+	payload.ToolNameMap = toolNameMap
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
@@ -2015,31 +2022,61 @@ func parseBase64Image(data, format string) *KiroImage {
 }
 
 func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
+	converted, _ := convertOpenAIToolsWithNameMap(tools)
+	return converted
+}
+
+func convertOpenAIToolsWithNameMap(tools []OpenAITool) ([]KiroToolWrapper, map[string]string) {
 	if len(tools) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	result := make([]KiroToolWrapper, 0, len(tools))
+	nameMap := make(map[string]string)
 	for _, tool := range tools {
-		if tool.Type != "function" {
+		if tool.Type != "function" && tool.Type != "custom" {
 			continue
 		}
 		desc := tool.Function.Description
 		if len(desc) > maxToolDescLen {
 			desc = desc[:maxToolDescLen] + "..."
 		}
-		name := shortenToolName(tool.Function.Name)
+		originalName := tool.Function.Name
+		name := shortenToolName(originalName)
 		if strings.TrimSpace(name) == "" {
 			// Kiro rejects tools with empty names; skip unusable specs.
 			continue
 		}
+		if name != originalName {
+			nameMap[name] = originalName
+		}
 		wrapper := KiroToolWrapper{}
 		wrapper.ToolSpecification.Name = name
 		wrapper.ToolSpecification.Description = normalizeToolDesc(desc, name)
-		wrapper.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(tool.Function.Parameters)}
+		if tool.Type == "custom" {
+			wrapper.ToolSpecification.InputSchema = InputSchema{JSON: customToolInputSchema()}
+		} else {
+			wrapper.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(tool.Function.Parameters)}
+		}
 		result = append(result, wrapper)
 	}
-	return result
+	if len(nameMap) == 0 {
+		nameMap = nil
+	}
+	return result, nameMap
+}
+
+func customToolInputSchema() interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			customToolInputField: map[string]interface{}{
+				"type":        "string",
+				"description": "The complete free-form input for this custom tool, returned exactly as the client should execute it.",
+			},
+		},
+		"required": []string{customToolInputField},
+	}
 }
 
 // ==================== Kiro -> OpenAI 转换 ====================

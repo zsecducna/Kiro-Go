@@ -40,6 +40,28 @@ func TestOpenAIToolAcceptsNestedFormat(t *testing.T) {
 	}
 }
 
+func TestOpenAIToolAcceptsCustomFormat(t *testing.T) {
+	custom := `{
+		"type":"custom",
+		"name":"exec",
+		"description":"Run JavaScript that orchestrates terminal tools",
+		"format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}
+	}`
+	var tool OpenAITool
+	if err := json.Unmarshal([]byte(custom), &tool); err != nil {
+		t.Fatalf("unmarshal custom tool: %v", err)
+	}
+	if tool.Type != "custom" || tool.Function.Name != "exec" {
+		t.Fatalf("unexpected custom tool: type=%q name=%q", tool.Type, tool.Function.Name)
+	}
+	if tool.Function.Description == "" {
+		t.Fatal("expected custom tool description to be preserved")
+	}
+	if len(tool.Format) == 0 {
+		t.Fatal("expected custom tool format to be preserved")
+	}
+}
+
 // TestConvertOpenAIToolsEmitsNonEmptyNames ensures the converter never emits a
 // tool spec with an empty name (Kiro rejects those) and preserves valid names.
 func TestConvertOpenAIToolsEmitsNonEmptyNames(t *testing.T) {
@@ -61,6 +83,29 @@ func TestConvertOpenAIToolsEmitsNonEmptyNames(t *testing.T) {
 	}
 	if wrappers[1].ToolSpecification.Name != "update_plan" {
 		t.Fatalf("expected update_plan preserved, got %q", wrappers[1].ToolSpecification.Name)
+	}
+}
+
+func TestConvertOpenAICustomToolWrapsFreeformInput(t *testing.T) {
+	tool := mustTool(t, `{"type":"custom","name":"exec","description":"Run terminal JavaScript"}`)
+	wrappers := convertOpenAITools([]OpenAITool{tool})
+	if len(wrappers) != 1 {
+		t.Fatalf("expected one custom tool wrapper, got %d", len(wrappers))
+	}
+	if wrappers[0].ToolSpecification.Name != "exec" {
+		t.Fatalf("expected exec tool name, got %q", wrappers[0].ToolSpecification.Name)
+	}
+	schema, ok := wrappers[0].ToolSpecification.InputSchema.JSON.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected object schema, got %#v", wrappers[0].ToolSpecification.InputSchema.JSON)
+	}
+	properties, ok := schema["properties"].(map[string]interface{})
+	if !ok || properties[customToolInputField] == nil {
+		t.Fatalf("expected %q string wrapper property, schema=%#v", customToolInputField, schema)
+	}
+	required, ok := schema["required"].([]string)
+	if !ok || len(required) != 1 || required[0] != customToolInputField {
+		t.Fatalf("expected required input field, schema=%#v", schema)
 	}
 }
 

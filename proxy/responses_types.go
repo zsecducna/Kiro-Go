@@ -42,6 +42,7 @@ type ResponseOutputItem struct {
 	CallID    string                `json:"call_id,omitempty"`
 	Name      string                `json:"name,omitempty"`
 	Arguments string                `json:"arguments,omitempty"`
+	Input     string                `json:"input,omitempty"`
 }
 
 type ResponseContentPart struct {

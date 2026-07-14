@@ -74,15 +74,15 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 				messages = append(messages, *msg)
 			}
 
-		case typ == "function_call_output" || typ == "tool_result":
+		case typ == "function_call_output" || typ == "custom_tool_call_output" || typ == "tool_result":
 			flushPendingUser()
 			callID, _ := obj["call_id"].(string)
 			if callID == "" {
 				callID, _ = obj["tool_call_id"].(string)
 			}
-			out := stringifyArbitrary(obj["output"])
+			out := stringifyResponseToolOutput(obj["output"])
 			if out == "" {
-				out = stringifyArbitrary(obj["content"])
+				out = stringifyResponseToolOutput(obj["content"])
 			}
 			messages = append(messages, OpenAIMessage{
 				Role:       "tool",
@@ -90,31 +90,21 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 				ToolCallID: callID,
 			})
 
-		case typ == "function_call":
+		case typ == "function_call" || typ == "custom_tool_call":
 			flushPendingUser()
 			tc := ToolCall{
 				ID:   stringField(obj, "call_id", "id"),
 				Type: "function",
 			}
 			tc.Function.Name, _ = obj["name"].(string)
-			tc.Function.Arguments = stringifyArbitrary(obj["arguments"])
-			// Merge consecutive function_call items into a single assistant
-			// message so parallel tool calls stay grouped in one turn. The
-			// Responses API emits each parallel call as a separate input item;
-			// keeping them in one assistant message preserves the tool_use /
-			// tool_result pairing that Kiro requires.
-			if n := len(messages); n > 0 &&
-				messages[n-1].Role == "assistant" &&
-				len(messages[n-1].ToolCalls) > 0 &&
-				strings.TrimSpace(extractOpenAIMessageText(messages[n-1].Content)) == "" {
-				messages[n-1].ToolCalls = append(messages[n-1].ToolCalls, tc)
+			if typ == "custom_tool_call" {
+				rawInput := stringifyArbitrary(obj["input"])
+				wrapped, _ := json.Marshal(map[string]string{customToolInputField: rawInput})
+				tc.Function.Arguments = string(wrapped)
 			} else {
-				messages = append(messages, OpenAIMessage{
-					Role:      "assistant",
-					Content:   "",
-					ToolCalls: []ToolCall{tc},
-				})
+				tc.Function.Arguments = stringifyArbitrary(obj["arguments"])
 			}
+			appendResponsesToolCall(&messages, tc)
 
 		case typ == "input_text" || typ == "text":
 			text, _ := obj["text"].(string)
@@ -219,6 +209,47 @@ func stringifyArbitrary(v interface{}) string {
 		}
 		return string(b)
 	}
+}
+
+func stringifyResponseToolOutput(v interface{}) string {
+	switch value := v.(type) {
+	case []interface{}:
+		var text strings.Builder
+		for _, item := range value {
+			switch part := item.(type) {
+			case string:
+				text.WriteString(part)
+			case map[string]interface{}:
+				if partText, ok := part["text"].(string); ok {
+					text.WriteString(partText)
+				}
+			}
+		}
+		if text.Len() > 0 {
+			return text.String()
+		}
+	}
+	return stringifyArbitrary(v)
+}
+
+// appendResponsesToolCall keeps parallel Responses API calls in one assistant
+// message so Kiro sees one tool-use turn followed by the matching results.
+func appendResponsesToolCall(messages *[]OpenAIMessage, tc ToolCall) {
+	if messages == nil {
+		return
+	}
+	if n := len(*messages); n > 0 &&
+		(*messages)[n-1].Role == "assistant" &&
+		len((*messages)[n-1].ToolCalls) > 0 &&
+		strings.TrimSpace(extractOpenAIMessageText((*messages)[n-1].Content)) == "" {
+		(*messages)[n-1].ToolCalls = append((*messages)[n-1].ToolCalls, tc)
+		return
+	}
+	*messages = append(*messages, OpenAIMessage{
+		Role:      "assistant",
+		Content:   "",
+		ToolCalls: []ToolCall{tc},
+	})
 }
 
 func stringField(obj map[string]interface{}, keys ...string) string {

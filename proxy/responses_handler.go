@@ -234,15 +234,7 @@ func buildResponsesObject(
 	}
 
 	for _, tu := range toolUses {
-		args, _ := json.Marshal(tu.Input)
-		output = append(output, ResponseOutputItem{
-			ID:        generateOutputItemID("fc"),
-			Type:      "function_call",
-			Status:    "completed",
-			CallID:    tu.ToolUseID,
-			Name:      tu.Name,
-			Arguments: string(args),
-		})
+		output = append(output, buildResponseToolItem(tu, req.Tools, "completed"))
 	}
 
 	if len(output) == 0 {
@@ -268,6 +260,52 @@ func buildResponsesObject(
 		Usage:              ResponsesUsage{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: inputTokens + outputTokens},
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
+	}
+}
+
+func responseToolType(tools []OpenAITool, name string) string {
+	for _, tool := range tools {
+		if tool.Function.Name == name || shortenToolName(tool.Function.Name) == name {
+			return tool.Type
+		}
+	}
+	return "function"
+}
+
+func customToolInput(input map[string]interface{}) string {
+	if raw, ok := input[customToolInputField].(string); ok {
+		return raw
+	}
+	if len(input) == 1 {
+		for _, value := range input {
+			if raw, ok := value.(string); ok {
+				return raw
+			}
+		}
+	}
+	encoded, _ := json.Marshal(input)
+	return string(encoded)
+}
+
+func buildResponseToolItem(tu KiroToolUse, tools []OpenAITool, status string) ResponseOutputItem {
+	if responseToolType(tools, tu.Name) == "custom" {
+		return ResponseOutputItem{
+			ID:     generateOutputItemID("ctc"),
+			Type:   "custom_tool_call",
+			Status: status,
+			CallID: tu.ToolUseID,
+			Name:   tu.Name,
+			Input:  customToolInput(tu.Input),
+		}
+	}
+	args, _ := json.Marshal(tu.Input)
+	return ResponseOutputItem{
+		ID:        generateOutputItemID("fc"),
+		Type:      "function_call",
+		Status:    status,
+		CallID:    tu.ToolUseID,
+		Name:      tu.Name,
+		Arguments: string(args),
 	}
 }
 
@@ -428,38 +466,85 @@ func (h *Handler) handleResponsesStream(
 				}
 
 				toolUses = append(toolUses, tu)
-				args, _ := json.Marshal(tu.Input)
-				fcID := generateOutputItemID("fc")
-				send("response.output_item.added", map[string]interface{}{
-					"type":         "response.output_item.added",
-					"output_index": outputIndex,
-					"item": map[string]interface{}{
-						"id":        fcID,
-						"type":      "function_call",
-						"status":    "in_progress",
-						"call_id":   tu.ToolUseID,
-						"name":      tu.Name,
-						"arguments": "",
-					},
-				})
-				send("response.function_call_arguments.delta", map[string]interface{}{
-					"type":         "response.function_call_arguments.delta",
-					"item_id":      fcID,
-					"output_index": outputIndex,
-					"delta":        string(args),
-				})
-				send("response.output_item.done", map[string]interface{}{
-					"type":         "response.output_item.done",
-					"output_index": outputIndex,
-					"item": map[string]interface{}{
-						"id":        fcID,
-						"type":      "function_call",
-						"status":    "completed",
-						"call_id":   tu.ToolUseID,
-						"name":      tu.Name,
-						"arguments": string(args),
-					},
-				})
+				if responseToolType(req.Tools, tu.Name) == "custom" {
+					input := customToolInput(tu.Input)
+					ctcID := generateOutputItemID("ctc")
+					send("response.output_item.added", map[string]interface{}{
+						"type":         "response.output_item.added",
+						"output_index": outputIndex,
+						"item": map[string]interface{}{
+							"id":      ctcID,
+							"type":    "custom_tool_call",
+							"status":  "in_progress",
+							"call_id": tu.ToolUseID,
+							"name":    tu.Name,
+							"input":   "",
+						},
+					})
+					send("response.custom_tool_call_input.delta", map[string]interface{}{
+						"type":         "response.custom_tool_call_input.delta",
+						"item_id":      ctcID,
+						"output_index": outputIndex,
+						"delta":        input,
+					})
+					send("response.custom_tool_call_input.done", map[string]interface{}{
+						"type":         "response.custom_tool_call_input.done",
+						"item_id":      ctcID,
+						"output_index": outputIndex,
+						"input":        input,
+					})
+					send("response.output_item.done", map[string]interface{}{
+						"type":         "response.output_item.done",
+						"output_index": outputIndex,
+						"item": map[string]interface{}{
+							"id":      ctcID,
+							"type":    "custom_tool_call",
+							"status":  "completed",
+							"call_id": tu.ToolUseID,
+							"name":    tu.Name,
+							"input":   input,
+						},
+					})
+				} else {
+					args, _ := json.Marshal(tu.Input)
+					fcID := generateOutputItemID("fc")
+					send("response.output_item.added", map[string]interface{}{
+						"type":         "response.output_item.added",
+						"output_index": outputIndex,
+						"item": map[string]interface{}{
+							"id":        fcID,
+							"type":      "function_call",
+							"status":    "in_progress",
+							"call_id":   tu.ToolUseID,
+							"name":      tu.Name,
+							"arguments": "",
+						},
+					})
+					send("response.function_call_arguments.delta", map[string]interface{}{
+						"type":         "response.function_call_arguments.delta",
+						"item_id":      fcID,
+						"output_index": outputIndex,
+						"delta":        string(args),
+					})
+					send("response.function_call_arguments.done", map[string]interface{}{
+						"type":         "response.function_call_arguments.done",
+						"item_id":      fcID,
+						"output_index": outputIndex,
+						"arguments":    string(args),
+					})
+					send("response.output_item.done", map[string]interface{}{
+						"type":         "response.output_item.done",
+						"output_index": outputIndex,
+						"item": map[string]interface{}{
+							"id":        fcID,
+							"type":      "function_call",
+							"status":    "completed",
+							"call_id":   tu.ToolUseID,
+							"name":      tu.Name,
+							"arguments": string(args),
+						},
+					})
+				}
 				outputIndex++
 				responseStarted = true
 			},

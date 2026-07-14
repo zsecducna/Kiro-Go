@@ -58,6 +58,44 @@ func TestResponsesParseArrayInput(t *testing.T) {
 	}
 }
 
+func TestResponsesParseCustomToolRoundTrip(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"run pwd"}]},
+		{"type":"custom_tool_call","call_id":"call_exec","name":"exec","input":"const r = await tools.exec_command({cmd:\"pwd\"}); text(r.output);"},
+		{"type":"custom_tool_call_output","call_id":"call_exec","output":[
+			{"type":"input_text","text":"Script completed\nOutput:\n"},
+			{"type":"input_text","text":"/workspace\n"}
+		]}
+	]`)
+	msgs, err := parseResponsesInput(raw)
+	if err != nil {
+		t.Fatalf("parse custom tool turn: %v", err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("expected user, assistant tool call, and tool output; got %d (%+v)", len(msgs), msgs)
+	}
+	if msgs[1].Role != "assistant" || len(msgs[1].ToolCalls) != 1 {
+		t.Fatalf("expected assistant custom tool call, got %+v", msgs[1])
+	}
+	call := msgs[1].ToolCalls[0]
+	if call.ID != "call_exec" || call.Function.Name != "exec" {
+		t.Fatalf("unexpected custom call: %+v", call)
+	}
+	var args map[string]string
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+		t.Fatalf("decode wrapped custom input: %v", err)
+	}
+	if !strings.Contains(args[customToolInputField], `cmd:"pwd"`) {
+		t.Fatalf("custom input was not preserved: %q", args[customToolInputField])
+	}
+	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "call_exec" {
+		t.Fatalf("expected matching custom tool output, got %+v", msgs[2])
+	}
+	if output, _ := msgs[2].Content.(string); output != "Script completed\nOutput:\n/workspace\n" {
+		t.Fatalf("unexpected flattened custom tool output: %q", output)
+	}
+}
+
 func TestResponsesStoreAndLoad(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(cfgFile); err != nil {
@@ -142,6 +180,35 @@ func TestResponsesPreviousResponseIDExpands(t *testing.T) {
 	}
 	if expanded[2].ToolCalls[0].ID != "call_prev" {
 		t.Fatalf("expected tool call id call_prev, got %+v", expanded[2].ToolCalls[0])
+	}
+}
+
+func TestResponsesPreviousResponseIDExpandsCustomToolCall(t *testing.T) {
+	prev := &ResponsesObject{
+		ID:          "resp_custom_prev",
+		StoredInput: json.RawMessage(`"run pwd"`),
+		Output: []ResponseOutputItem{{
+			ID:     "ctc_prev",
+			Type:   "custom_tool_call",
+			CallID: "call_prev_custom",
+			Name:   "exec",
+			Input:  "pwd",
+		}},
+	}
+
+	expanded := expandPreviousResponseHistory(prev)
+	if len(expanded) != 2 {
+		t.Fatalf("expected user and custom tool call, got %d (%+v)", len(expanded), expanded)
+	}
+	if expanded[1].Role != "assistant" || len(expanded[1].ToolCalls) != 1 {
+		t.Fatalf("expected restored custom tool call, got %+v", expanded[1])
+	}
+	var args map[string]string
+	if err := json.Unmarshal([]byte(expanded[1].ToolCalls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("decode restored custom input: %v", err)
+	}
+	if args[customToolInputField] != "pwd" {
+		t.Fatalf("expected restored custom input pwd, got %#v", args)
 	}
 }
 
@@ -356,6 +423,68 @@ func TestResponsesNonStreamRoundTrip(t *testing.T) {
 	}
 }
 
+func TestResponsesNonStreamCustomToolCall(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	var upstreamPayload string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		upstreamPayload = string(body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "call_exec",
+			"name":      "exec",
+			"input":     `{"input":"const r = await tools.exec_command({cmd:\"pwd\"}); text(r.output);"}`,
+			"stop":      true,
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	body := strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"input":"run pwd",
+		"store":false,
+		"tools":[{
+			"type":"custom",
+			"name":"exec",
+			"description":"Run JavaScript that orchestrates terminal tools",
+			"format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}
+		}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", body)
+	rec := httptest.NewRecorder()
+
+	h.handleOpenAIResponses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(upstreamPayload, `"name":"exec"`) ||
+		!strings.Contains(upstreamPayload, `"required":["input"]`) {
+		t.Fatalf("custom tool was not bridged to Kiro schema: %s", upstreamPayload)
+	}
+
+	var resp ResponsesObject
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
+	}
+	if len(resp.Output) != 1 {
+		t.Fatalf("expected one custom tool call, got %+v", resp.Output)
+	}
+	call := resp.Output[0]
+	if call.Type != "custom_tool_call" || call.CallID != "call_exec" || call.Name != "exec" {
+		t.Fatalf("unexpected custom tool response item: %+v", call)
+	}
+	if !strings.Contains(call.Input, `cmd:"pwd"`) {
+		t.Fatalf("expected raw custom input, got %q", call.Input)
+	}
+	if call.Arguments != "" {
+		t.Fatalf("custom call must not expose function arguments: %+v", call)
+	}
+}
+
 func TestResponsesStreamSSE(t *testing.T) {
 	h, cleanup := setupResponsesTestHandler(t)
 	defer cleanup()
@@ -389,5 +518,56 @@ func TestResponsesStreamSSE(t *testing.T) {
 	}
 	if !strings.Contains(bodyStr, "stream chunk") {
 		t.Fatalf("expected stream content delta, got:\n%s", bodyStr)
+	}
+}
+
+func TestResponsesStreamCustomToolCall(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "call_exec_stream",
+			"name":      "exec",
+			"input":     `{"input":"pwd"}`,
+			"stop":      true,
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	body := strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"input":"run pwd",
+		"stream":true,
+		"store":false,
+		"tools":[{"type":"custom","name":"exec","description":"Run a terminal command"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", body)
+	rec := httptest.NewRecorder()
+
+	h.handleOpenAIResponses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	bodyStr := rec.Body.String()
+	for _, expected := range []string{
+		"event: response.output_item.added",
+		"event: response.custom_tool_call_input.delta",
+		"event: response.custom_tool_call_input.done",
+		"event: response.output_item.done",
+		"event: response.completed",
+		`"type":"custom_tool_call"`,
+		`"call_id":"call_exec_stream"`,
+		`"input":"pwd"`,
+	} {
+		if !strings.Contains(bodyStr, expected) {
+			t.Fatalf("missing %q in custom tool stream:\n%s", expected, bodyStr)
+		}
+	}
+	if strings.Contains(bodyStr, "response.function_call_arguments.delta") {
+		t.Fatalf("custom tool stream emitted function-call argument events:\n%s", bodyStr)
 	}
 }

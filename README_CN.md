@@ -12,7 +12,8 @@
 
 ## 功能特性
 
-- Anthropic `/v1/messages` 与 OpenAI `/v1/chat/completions`
+- Anthropic `/v1/messages`，以及 OpenAI `/v1/chat/completions`、`/v1/responses`
+- Responses API 支持函数工具和 Codex 使用的自由文本 `custom` 工具
 - 多账号池轮询负载均衡
 - 自动 Token 刷新、SSE 流式输出、Web 管理面板
 - 多种认证方式：AWS Builder ID、IAM Identity Center (企业 SSO)、SSO Token、本地缓存、凭证 JSON
@@ -94,6 +95,27 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer any" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"你好！"}]}'
+```
+
+### Codex
+
+在 `~/.codex/config.toml` 中添加 Responses API 提供方：
+
+```toml
+model = "auto"
+model_provider = "kiro_go"
+
+[model_providers.kiro_go]
+name = "Kiro-Go"
+base_url = "http://localhost:8080/v1"
+env_key = "KIRO_GO_API_KEY"
+wire_api = "responses"
+```
+
+启动 Codex 前设置一个 API Key；未开启 Kiro-Go API Key 校验时可以使用任意非空值：
+
+```bash
+export KIRO_GO_API_KEY=any
 ```
 
 ## 思考模式

@@ -12,7 +12,8 @@ If this project helps you, a Star would mean a lot.
 
 ## Features
 
-- Anthropic `/v1/messages` & OpenAI `/v1/chat/completions`
+- Anthropic `/v1/messages`, plus OpenAI `/v1/chat/completions` and `/v1/responses`
+- Responses API function tools and free-form `custom` tools used by Codex
 - Multi-account pool with round-robin load balancing
 - Auto token refresh, SSE streaming, Web admin panel
 - Multiple auth: AWS Builder ID, IAM Identity Center (Enterprise SSO), SSO Token, local cache, credentials JSON
@@ -94,6 +95,27 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer any" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+### Codex
+
+Add a Responses API provider to `~/.codex/config.toml`:
+
+```toml
+model = "auto"
+model_provider = "kiro_go"
+
+[model_providers.kiro_go]
+name = "Kiro-Go"
+base_url = "http://localhost:8080/v1"
+env_key = "KIRO_GO_API_KEY"
+wire_api = "responses"
+```
+
+Set an API key before starting Codex. Any non-empty value works when Kiro-Go API key validation is disabled:
+
+```bash
+export KIRO_GO_API_KEY=any
 ```
 
 ## Thinking Mode

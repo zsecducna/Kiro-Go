@@ -302,7 +302,8 @@ func TestAdminAddKiroApiKey(t *testing.T) {
 		t.Fatalf("expected 401 with wrong admin key, got %d", rec.Code)
 	}
 
-	// Valid add (enabled:false to avoid the live model-fetch goroutine).
+	// Explicit region → trusted without probing (no live network), enabled:false
+	// avoids the model-fetch goroutine.
 	rec := serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key",
 		`{"kiroApiKey":"ksk_pool1","nickname":"cap-1","region":"eu-west-1","enabled":false}`, "topsecret"))
 	if rec.Code != http.StatusOK {
@@ -311,6 +312,14 @@ func TestAdminAddKiroApiKey(t *testing.T) {
 	body := decodeBody(t, rec)
 	if body["success"] != true || body["enabled"] != false {
 		t.Fatalf("unexpected response: %v", body)
+	}
+	addedList, ok := body["added"].([]interface{})
+	if !ok || len(addedList) != 1 {
+		t.Fatalf("expected 1 added entry, got %v", body["added"])
+	}
+	first := addedList[0].(map[string]interface{})
+	if first["region"] != "eu-west-1" {
+		t.Fatalf("expected region eu-west-1, got %v", first["region"])
 	}
 
 	var stored *config.Account
@@ -324,19 +333,21 @@ func TestAdminAddKiroApiKey(t *testing.T) {
 	if stored == nil {
 		t.Fatal("kiro api key account not persisted")
 	}
-	if body["id"] != stored.ID {
-		t.Fatalf("response id %v != stored id %s", body["id"], stored.ID)
+	if first["id"] != stored.ID {
+		t.Fatalf("response id %v != stored id %s", first["id"], stored.ID)
 	}
 	if !stored.IsApiKeyCredential() || stored.AccessToken != "ksk_pool1" || stored.ExpiresAt != 0 ||
 		stored.Region != "eu-west-1" || stored.Nickname != "cap-1" || stored.Enabled {
 		t.Fatalf("account not normalized: %+v", stored)
 	}
 
-	// Idempotent retry: same key → same id, duplicate flag, no second account.
+	// Idempotent retry: same key+region → duplicate flag, no second account.
 	rec = serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key",
-		`{"kiroApiKey":"ksk_pool1","enabled":false}`, "topsecret"))
+		`{"kiroApiKey":"ksk_pool1","region":"eu-west-1","enabled":false}`, "topsecret"))
 	dupBody := decodeBody(t, rec)
-	if dupBody["duplicate"] != true || dupBody["id"] != stored.ID {
+	dupAdded := dupBody["added"].([]interface{})
+	if len(dupAdded) != 1 || dupAdded[0].(map[string]interface{})["duplicate"] != true ||
+		dupAdded[0].(map[string]interface{})["id"] != stored.ID {
 		t.Fatalf("expected idempotent duplicate, got %v", dupBody)
 	}
 	count := 0

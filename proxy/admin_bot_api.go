@@ -196,22 +196,29 @@ func (h *Handler) handleAdminBotStats(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	// --- Account side. The pool slice can contain duplicate entries for the
-	// same account ID (multi-region profiles), so dedupe before summing.
+	// --- Account side. Dedupe by the underlying Kiro account, not the pool row:
+	// the same account can appear multiple times — multi-region profiles, or several
+	// API keys minted from one Kiro account — and its single quota must be counted
+	// ONCE. Key on UserId (the stable Kiro identity), falling back to the account ID
+	// when UserId is unknown (behaves as before for un-refreshed accounts).
 	accounts := h.pool.GetAllAccounts()
 	seen := make(map[string]bool, len(accounts))
 	var accountsTotal, accountsUsed, accountsAvailable float64
 	usableAccounts := 0
 	for _, acc := range accounts {
-		if seen[acc.ID] {
-			continue
-		}
-		seen[acc.ID] = true
-		// Banned/suspended or manually disabled accounts can't serve traffic,
-		// so their remaining credits must not be counted as sellable.
+		// Skip unusable rows BEFORE claiming the identity slot, so a dead row
+		// encountered first doesn't shadow a healthy same-account row behind it.
 		if !acc.Enabled || strings.EqualFold(acc.BanStatus, "BANNED") || strings.EqualFold(acc.BanStatus, "SUSPENDED") {
 			continue
 		}
+		dedupeKey := strings.TrimSpace(acc.UserId)
+		if dedupeKey == "" {
+			dedupeKey = acc.ID
+		}
+		if seen[dedupeKey] {
+			continue
+		}
+		seen[dedupeKey] = true
 		usableAccounts++
 		accountsTotal += acc.UsageLimit
 		accountsUsed += acc.UsageCurrent
@@ -271,7 +278,7 @@ func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 type adminAddKiroApiKeyRequest struct {
 	KiroApiKey string `json:"kiroApiKey"`         // The Kiro API key (ksk_...); required
 	Nickname   string `json:"nickname,omitempty"` // Optional label for the admin panel
-	Region     string `json:"region,omitempty"`   // Explicit region (skips probing); omit to auto-probe candidates
+	Region     string `json:"region,omitempty"`   // Explicit region limits the probe set to that one; omit to probe all candidates
 	Enabled    *bool  `json:"enabled,omitempty"`  // Whether to route traffic immediately (default true)
 }
 
@@ -280,13 +287,16 @@ type adminAddKiroApiKeyRequest struct {
 // /admin/new_api_key (which mints customer keys): the Telegram bot uses it to
 // provision the Kiro capacity that backs the keys it sells. Normalizes each
 // account exactly like the admin-panel add-account flow (AuthMethod=api_key,
-// AccessToken mirrored, ExpiresAt=0 so it is never token-refreshed).
+// AccessToken mirrored, ExpiresAt=0 so it is never token-refreshed) and persists
+// the fetched subscription/usage so the admin sees real quota immediately.
 //
-// Region behavior: when the caller omits region, the key is probed against each
-// candidate data-plane region (us-east-1, eu-central-1) and an account is added
-// for EVERY region it serves — a multi-region key yields one pool slot per region.
-// An explicit region is trusted without probing. Idempotent per (key, region).
-// Response: {success, enabled, added:[{id,region,duplicate?}], skipped:[{region,error}]}.
+// Region behavior: the key is probed against each candidate data-plane region
+// (us-east-1, eu-central-1; an explicit region limits the set to that one) and an
+// account is added for EVERY region it serves — a multi-region key yields one pool
+// slot per region. Deduplicated per (Kiro account identity, region): one Kiro
+// account can mint many keys, so a second key from the same account in the same
+// region returns the existing slot instead of doubling its routing weight/quota.
+// Response: {success, enabled, added:[{id,region,email,duplicate?}], skipped:[{region,error}]}.
 func (h *Handler) handleAdminAddKiroApiKey(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
@@ -316,23 +326,22 @@ func (h *Handler) handleAdminAddKiroApiKey(w http.ResponseWriter, r *http.Reques
 		enabled = *req.Enabled
 	}
 
-	// Determine which regions to add. An explicit region is trusted as-is (operator
-	// override, no probe). When omitted, probe each candidate data-plane region
-	// (us-east-1, eu-central-1 by default; KIRO_PROFILE_REGIONS overrides) and add an
-	// account for EVERY region the key actually serves — a key provisioned in more
-	// than one region then gets a pool slot per region for redundancy/throughput.
+	// Determine which regions to consider. An explicit region limits the set to just
+	// that one; otherwise use the candidate set (us-east-1, eu-central-1 by default;
+	// KIRO_PROFILE_REGIONS overrides). Every region is probed — the probe both
+	// validates the key there AND returns the underlying Kiro account identity
+	// (UserId/Email), which is what lets us deduplicate.
 	var targetRegions []string
-	probe := false
 	if explicit := strings.TrimSpace(req.Region); explicit != "" {
 		targetRegions = []string{explicit}
 	} else {
 		targetRegions = kiroApiKeyCandidateRegions()
-		probe = true
 	}
 
 	type addedView struct {
 		ID        string `json:"id"`
 		Region    string `json:"region"`
+		Email     string `json:"email,omitempty"`
 		Duplicate bool   `json:"duplicate,omitempty"`
 	}
 	added := make([]addedView, 0, len(targetRegions))
@@ -340,22 +349,29 @@ func (h *Handler) handleAdminAddKiroApiKey(w http.ResponseWriter, r *http.Reques
 	var warm []config.Account
 
 	for _, region := range targetRegions {
-		// Idempotency is per (key, region): a retry — or a second region on the same
-		// key — must not duplicate an existing pool account.
-		if existing := findApiKeyAccount(req.KiroApiKey, region); existing != nil {
-			added = append(added, addedView{ID: existing.ID, Region: region, Duplicate: true})
+		// Probe: validates the key in this region and returns the account identity.
+		info, err := probeKiroApiKey(req.KiroApiKey, region)
+		if err != nil {
+			skipped = append(skipped, map[string]string{"region": region, "error": err.Error()})
 			continue
 		}
-		// Only add regions the key can actually use, so a us-east-1-only key doesn't
-		// leave a dead eu-central-1 account that 403s on every request.
-		if probe {
-			if err := probeKiroApiKeyRegion(req.KiroApiKey, region); err != nil {
-				skipped = append(skipped, map[string]string{"region": region, "error": err.Error()})
-				continue
-			}
+
+		// Deduplicate on the UNDERLYING Kiro account, not the key string: one Kiro
+		// account can mint many API keys, and adding two of them (or an api_key next
+		// to an existing OAuth login for the same account) would double that single
+		// account's routing weight and double-count its quota in /admin/pool. Match by
+		// UserId within the same region; a different region for the same account is a
+		// deliberate multi-region slot and is allowed. Fall back to the key value when
+		// the upstream did not return a UserId.
+		if existing := findAccountForKiroIdentity(info.UserId, req.KiroApiKey, region); existing != nil {
+			added = append(added, addedView{ID: existing.ID, Region: region, Email: existing.Email, Duplicate: true})
+			continue
 		}
+
 		account := config.Account{
 			ID:          auth.GenerateAccountID(),
+			Email:       info.Email,
+			UserId:      info.UserId,
 			Nickname:    strings.TrimSpace(req.Nickname),
 			KiroApiKey:  req.KiroApiKey,
 			AccessToken: req.KiroApiKey, // mirror for pool compatibility (see apiAddAccount)
@@ -369,7 +385,13 @@ func (h *Handler) handleAdminAddKiroApiKey(w http.ResponseWriter, r *http.Reques
 			skipped = append(skipped, map[string]string{"region": region, "error": err.Error()})
 			continue
 		}
-		added = append(added, addedView{ID: account.ID, Region: region})
+		// Persist the subscription/usage the probe already fetched so /admin/pool
+		// reflects this account's real quota immediately (not only after the next
+		// background refresh).
+		if updateErr := config.UpdateAccountInfo(account.ID, *info); updateErr != nil {
+			logger.Warnf("[AddKiroApiKey] failed to persist account info for %s: %v", account.ID, updateErr)
+		}
+		added = append(added, addedView{ID: account.ID, Region: region, Email: info.Email})
 		warm = append(warm, account)
 	}
 
@@ -425,11 +447,36 @@ func kiroApiKeyCandidateRegions() []string {
 	return defaultKiroProfileRegions
 }
 
-// findApiKeyAccount returns a pointer to the existing api_key account matching the
-// given key and region, or nil. Used for per-(key,region) idempotency.
-func findApiKeyAccount(key, region string) *config.Account {
+// normalizeRegion trims and treats an empty region as us-east-1, matching how the
+// rest of the code resolves the effective data-plane region.
+func normalizeRegion(region string) string {
+	if r := strings.TrimSpace(region); r != "" {
+		return r
+	}
+	return "us-east-1"
+}
+
+// findAccountForKiroIdentity returns an existing pool account that represents the
+// SAME underlying Kiro account in the same region, or nil. It matches on UserId
+// (the Kiro account identity — stable across the multiple API keys one account can
+// mint) and falls back to the key value when UserId is unknown. Region is part of
+// the match so a deliberate multi-region slot for the same account is not treated
+// as a duplicate.
+func findAccountForKiroIdentity(userID, key, region string) *config.Account {
+	userID = strings.TrimSpace(userID)
+	want := normalizeRegion(region)
 	for _, a := range config.GetAccounts() {
-		if a.KiroApiKey == key && strings.EqualFold(strings.TrimSpace(a.Region), strings.TrimSpace(region)) {
+		// Empty Region means us-east-1 everywhere else in the codebase, so normalize
+		// both sides — otherwise an OAuth account with Region:"" wouldn't dedupe
+		// against a us-east-1 probe of the same Kiro account.
+		if !strings.EqualFold(normalizeRegion(a.Region), want) {
+			continue
+		}
+		if userID != "" && strings.TrimSpace(a.UserId) == userID {
+			cp := a
+			return &cp
+		}
+		if a.KiroApiKey == key {
 			cp := a
 			return &cp
 		}
@@ -437,18 +484,21 @@ func findApiKeyAccount(key, region string) *config.Account {
 	return nil
 }
 
-// probeKiroApiKeyRegion tests whether the key is usable in a specific data-plane
-// region by issuing a region-targeted getUsageLimits with it. Returns nil when the
-// key serves that region. Uses a throwaway in-memory account (never persisted).
-func probeKiroApiKeyRegion(key, region string) error {
+// probeKiroApiKey validates the key in a specific data-plane region and returns the
+// underlying Kiro account info (identity + subscription + usage) fetched in the same
+// call. Uses a throwaway in-memory account (never persisted). A non-nil error means
+// the key does not serve that region. It is a package var so tests can stub the
+// upstream round-trip.
+var probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
 	acc := &config.Account{
 		KiroApiKey:  key,
 		AccessToken: key,
 		AuthMethod:  "api_key",
 		Region:      region,
 	}
-	if _, err := GetUsageLimits(acc); err != nil {
-		return err
+	info, err := RefreshAccountInfo(acc)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	return info, nil
 }

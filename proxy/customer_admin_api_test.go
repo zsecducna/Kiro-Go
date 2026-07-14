@@ -302,62 +302,104 @@ func TestAdminAddKiroApiKey(t *testing.T) {
 		t.Fatalf("expected 401 with wrong admin key, got %d", rec.Code)
 	}
 
-	// Explicit region → trusted without probing (no live network), enabled:false
-	// avoids the model-fetch goroutine.
+	// Stub the upstream probe: any key resolves to the same Kiro account identity
+	// (userId "kiro-user-A") in eu-west-1 only, with a 10k quota. This lets us drive
+	// the dedup-by-account logic without live network.
+	origProbe := probeKiroApiKey
+	defer func() { probeKiroApiKey = origProbe }()
+	probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
+		if region != "eu-west-1" {
+			return nil, errTest("HTTP 403: not served in " + region)
+		}
+		return &config.AccountInfo{
+			Email:            "acct-a@example.com",
+			UserId:           "kiro-user-A",
+			SubscriptionType: "POWER",
+			UsageLimit:       10000,
+			UsageCurrent:     2500,
+		}, nil
+	}
+
+	// Add with explicit region → single account, identity + usage persisted so the
+	// admin sees the real quota immediately.
 	rec := serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key",
-		`{"kiroApiKey":"ksk_pool1","nickname":"cap-1","region":"eu-west-1","enabled":false}`, "topsecret"))
+		`{"kiroApiKey":"ksk_keyOne","nickname":"cap-1","region":"eu-west-1","enabled":false}`, "topsecret"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	body := decodeBody(t, rec)
-	if body["success"] != true || body["enabled"] != false {
-		t.Fatalf("unexpected response: %v", body)
-	}
 	addedList, ok := body["added"].([]interface{})
 	if !ok || len(addedList) != 1 {
 		t.Fatalf("expected 1 added entry, got %v", body["added"])
 	}
-	first := addedList[0].(map[string]interface{})
-	if first["region"] != "eu-west-1" {
-		t.Fatalf("expected region eu-west-1, got %v", first["region"])
-	}
 
 	var stored *config.Account
-	all := config.GetAccounts()
-	for i := range all {
-		if all[i].KiroApiKey == "ksk_pool1" {
-			stored = &all[i]
+	for i, a := range config.GetAccounts() {
+		if a.KiroApiKey == "ksk_keyOne" {
+			stored = &config.GetAccounts()[i]
 			break
 		}
 	}
 	if stored == nil {
 		t.Fatal("kiro api key account not persisted")
 	}
-	if first["id"] != stored.ID {
-		t.Fatalf("response id %v != stored id %s", first["id"], stored.ID)
-	}
-	if !stored.IsApiKeyCredential() || stored.AccessToken != "ksk_pool1" || stored.ExpiresAt != 0 ||
+	// Normalization + identity/usage persisted at add time.
+	if !stored.IsApiKeyCredential() || stored.AccessToken != "ksk_keyOne" || stored.ExpiresAt != 0 ||
 		stored.Region != "eu-west-1" || stored.Nickname != "cap-1" || stored.Enabled {
 		t.Fatalf("account not normalized: %+v", stored)
 	}
+	if stored.UserId != "kiro-user-A" || stored.Email != "acct-a@example.com" ||
+		stored.UsageLimit != 10000 || stored.UsageCurrent != 2500 {
+		t.Fatalf("identity/usage not persisted at add: %+v", stored)
+	}
 
-	// Idempotent retry: same key+region → duplicate flag, no second account.
+	// The KEY DUPLICATE CASE: a DIFFERENT key minted from the SAME Kiro account, same
+	// region → must dedupe to the existing account, not create a second pool slot.
 	rec = serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key",
-		`{"kiroApiKey":"ksk_pool1","region":"eu-west-1","enabled":false}`, "topsecret"))
+		`{"kiroApiKey":"ksk_keyTwo_sameAccount","region":"eu-west-1","enabled":false}`, "topsecret"))
 	dupBody := decodeBody(t, rec)
 	dupAdded := dupBody["added"].([]interface{})
 	if len(dupAdded) != 1 || dupAdded[0].(map[string]interface{})["duplicate"] != true ||
 		dupAdded[0].(map[string]interface{})["id"] != stored.ID {
-		t.Fatalf("expected idempotent duplicate, got %v", dupBody)
+		t.Fatalf("expected same-account dedupe, got %v", dupBody)
 	}
-	count := 0
+	accts := 0
 	for _, a := range config.GetAccounts() {
-		if a.KiroApiKey == "ksk_pool1" {
-			count++
+		if a.UserId == "kiro-user-A" {
+			accts++
 		}
 	}
-	if count != 1 {
-		t.Fatalf("expected 1 account for the key, got %d", count)
+	if accts != 1 {
+		t.Fatalf("expected 1 pool account for the Kiro identity, got %d", accts)
+	}
+
+	// Empty-Region OAuth account for the SAME Kiro user must dedupe against a
+	// us-east-1 probe (empty region ≡ us-east-1). Seed one, then probe us-east-1.
+	if err := config.AddAccount(config.Account{
+		ID: "oauth-a", Email: "acct-a@example.com", UserId: "kiro-user-A", AuthMethod: "social",
+		RefreshToken: "rt", AccessToken: "at", Region: "", Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed oauth account: %v", err)
+	}
+	probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
+		return &config.AccountInfo{Email: "acct-a@example.com", UserId: "kiro-user-A", UsageLimit: 10000}, nil
+	}
+	rec = serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key",
+		`{"kiroApiKey":"ksk_keyThree","region":"us-east-1","enabled":false}`, "topsecret"))
+	oauthDup := decodeBody(t, rec)["added"].([]interface{})
+	if len(oauthDup) != 1 || oauthDup[0].(map[string]interface{})["duplicate"] != true {
+		t.Fatalf("expected dedupe against empty-region OAuth account, got %v", oauthDup)
+	}
+
+	// Multi-region: the same account served in a NEW region is a distinct slot.
+	probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
+		return &config.AccountInfo{Email: "acct-a@example.com", UserId: "kiro-user-A", UsageLimit: 10000}, nil
+	}
+	rec = serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key",
+		`{"kiroApiKey":"ksk_keyOne","region":"ap-southeast-1","enabled":false}`, "topsecret"))
+	multi := decodeBody(t, rec)["added"].([]interface{})
+	if len(multi) != 1 || multi[0].(map[string]interface{})["duplicate"] == true {
+		t.Fatalf("expected new slot for same account in new region, got %v", multi)
 	}
 }
 

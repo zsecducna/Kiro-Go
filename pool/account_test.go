@@ -554,3 +554,50 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
 	}
 }
+
+// TestLatencyAggregateAndHealthSnapshots verifies the /v1/stats and /admin/pool
+// health surfaces: LatencyAggregate ignores accounts with no samples and reports
+// the distribution; HealthSnapshots reports per-account latency + circuit state.
+func TestLatencyAggregateAndHealthSnapshots(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "a", Email: "a@x"},
+		config.Account{ID: "b", Email: "b@x"},
+		config.Account{ID: "c", Email: "c@x"}, // never dispatched → no samples
+	)
+
+	// Feed latency for a and b only. First sample seeds the EWMA directly.
+	p.RecordLatency("a", 100)
+	p.RecordLatency("b", 300)
+
+	agg := p.LatencyAggregate()
+	if agg.AccountsWithData != 2 {
+		t.Fatalf("expected 2 accounts with data (c has none), got %d", agg.AccountsWithData)
+	}
+	if agg.LatencyMsMin != 100 || agg.LatencyMsMax != 300 {
+		t.Fatalf("min/max wrong: %+v", agg)
+	}
+	if agg.LatencyMsMean != 200 {
+		t.Fatalf("mean expected 200, got %v", agg.LatencyMsMean)
+	}
+
+	snaps := p.HealthSnapshots()
+	if len(snaps) != 3 {
+		t.Fatalf("expected a snapshot per account, got %d", len(snaps))
+	}
+	byID := map[string]AccountHealthSnapshot{}
+	for _, s := range snaps {
+		byID[s.ID] = s
+	}
+	if byID["a"].LatencyMsEWMA != 100 || byID["a"].Samples == 0 {
+		t.Fatalf("account a snapshot wrong: %+v", byID["a"])
+	}
+	if byID["c"].Samples != 0 || byID["c"].LatencyMsEWMA != 0 {
+		t.Fatalf("account c should have no data: %+v", byID["c"])
+	}
+	// All breakers untouched → closed.
+	for id, s := range byID {
+		if s.Circuit != "closed" {
+			t.Fatalf("account %s expected closed circuit, got %q", id, s.Circuit)
+		}
+	}
+}

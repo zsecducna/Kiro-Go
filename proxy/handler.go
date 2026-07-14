@@ -504,6 +504,10 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":    h.getCredits(),
 		"cache":           h.promptCache.Stats(),
+		// Customer-safe latency distribution (no account identities): with session
+		// affinity on, warm accounts pull the mean/min down over time.
+		"dispatchLatency": h.pool.LatencyAggregate(),
+		"sessionAffinity": config.GetSessionAffinityEnabled(),
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }

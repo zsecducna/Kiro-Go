@@ -453,6 +453,12 @@ func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 		},
 		// Headline number: credits still available to sell as new API keys.
 		"sellableCredits": accountsAvailable - soldOutstanding,
+		// Per-account dispatch/health detail (admin-only — carries account
+		// identities). Use it to watch session affinity working: a key's traffic
+		// concentrating on one account drives that account's latencyMsEwma down as
+		// its upstream cache warms, while spread-out accounts stay higher.
+		"sessionAffinity": config.GetSessionAffinityEnabled(),
+		"health":          h.pool.HealthSnapshots(),
 	})
 }
 

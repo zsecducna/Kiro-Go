@@ -875,3 +875,97 @@ func (p *AccountPool) reprobeDisabled() {
 		p.mu.Unlock()
 	}
 }
+
+// AccountHealthSnapshot is a read-only view of one account's dispatch/health
+// signals, surfaced to operators (admin /admin/pool) so the effect of session
+// affinity and health-aware routing is observable: a warm, stuck-to account
+// shows lower LatencyMsEWMA than a cold one that keeps getting re-picked.
+type AccountHealthSnapshot struct {
+	ID              string  `json:"id"`
+	Email           string  `json:"email,omitempty"`
+	LatencyMsEWMA   float64 `json:"latencyMsEwma"`
+	ErrorRateEWMA   float64 `json:"errorRateEwma"`
+	Samples         int     `json:"samples"`
+	Circuit         string  `json:"circuit"` // closed | open | half-open
+	CooldownActive  bool    `json:"cooldownActive"`
+	LastDispatchSeq uint64  `json:"lastDispatchSeq"` // monotonic LRU clock; higher = more recently dispatched
+}
+
+// HealthSnapshots returns a per-account health view for every account currently
+// in the pool. Lock order is p.mu (RLock) then each breaker's own mutex — the
+// same order the dispatch path uses (p.mu held while calling cb.isOpen) — so
+// this introduces no new deadlock risk.
+func (p *AccountPool) HealthSnapshots() []AccountHealthSnapshot {
+	now := time.Now()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]AccountHealthSnapshot, 0, len(p.accounts))
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		snap := AccountHealthSnapshot{
+			ID:              acc.ID,
+			Email:           acc.Email,
+			Circuit:         "closed",
+			LastDispatchSeq: p.lastDispatchSeq[acc.ID],
+		}
+		if h := p.healthStats[acc.ID]; h != nil {
+			snap.LatencyMsEWMA = h.ewmaLatencyMs
+			snap.ErrorRateEWMA = h.ewmaErrorRate
+			snap.Samples = h.samples
+		}
+		if cb := p.circuitState[acc.ID]; cb != nil {
+			cb.mu.Lock()
+			switch cb.state {
+			case circuitOpen:
+				snap.Circuit = "open"
+			case circuitHalfOpen:
+				snap.Circuit = "half-open"
+			}
+			cb.mu.Unlock()
+		}
+		if cd, ok := p.cooldowns[acc.ID]; ok && now.Before(cd) {
+			snap.CooldownActive = true
+		}
+		out = append(out, snap)
+	}
+	return out
+}
+
+// LatencyAggregate is a customer-safe summary of dispatch latency across the
+// pool: no account identities, just the distribution. Surfaced in /v1/stats so
+// the effect of session affinity is visible without leaking pool internals.
+type LatencyAggregate struct {
+	AccountsWithData int     `json:"accountsWithData"`
+	LatencyMsMean    float64 `json:"latencyMsMean"`
+	LatencyMsMin     float64 `json:"latencyMsMin"`
+	LatencyMsMax     float64 `json:"latencyMsMax"`
+}
+
+// LatencyAggregate summarizes per-account EWMA latency without exposing which
+// account is which. Accounts with no recorded latency are ignored (includes
+// accounts that only logged errors, since they have no latency to average).
+func (p *AccountPool) LatencyAggregate() LatencyAggregate {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var agg LatencyAggregate
+	var sum float64
+	for i := range p.accounts {
+		h := p.healthStats[p.accounts[i].ID]
+		if h == nil || h.samples == 0 || h.ewmaLatencyMs <= 0 {
+			continue
+		}
+		l := h.ewmaLatencyMs
+		if agg.AccountsWithData == 0 || l < agg.LatencyMsMin {
+			agg.LatencyMsMin = l
+		}
+		if l > agg.LatencyMsMax {
+			agg.LatencyMsMax = l
+		}
+		sum += l
+		agg.AccountsWithData++
+	}
+	if agg.AccountsWithData > 0 {
+		agg.LatencyMsMean = sum / float64(agg.AccountsWithData)
+	}
+	return agg
+}

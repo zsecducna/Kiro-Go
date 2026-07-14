@@ -1,7 +1,6 @@
 {
   "login.title": "登录",
   "login.subtitle": "请输入管理密码以继续",
-
   "login.password": "管理密码",
   "login.passwordPlaceholder": "输入密码",
   "login.submit": "登录",
@@ -227,6 +226,8 @@
   "modal.credentialsDesc": "通过 Kiro Account Manager 导出的凭证添加账号",
   "modal.cookieTitle": "Kiro 网页 Cookie",
   "modal.cookieDesc": "通过从 Kiro 网页 Cookie 中获取的 RefreshToken 添加账号",
+  "modal.apiKeyTitle": "API 密钥",
+  "modal.apiKeyDesc": "通过 Kiro API 密钥 (ksk_...) 添加账号，用于无头集成。",
   "modal.enterpriseSsoTitle": "企业 SSO - Microsoft 365",
   "modal.enterpriseSsoDesc": "通过 Kiro 托管 SSO 添加 Microsoft 365 / Entra ID（Azure AD）租户账号",
   "kirosso.hostNote": "请在运行代理的本机打开登录链接（与代理同一主机）。浏览器会自动跳转到 Microsoft 365 登录流程。",
@@ -496,5 +497,12 @@
   "errors.typeSuspended": "封禁",
   "errors.typeOverage": "超额",
   "errors.typeProfile": "配置",
-  "errors.typeUnknown": "未知"
+  "errors.typeUnknown": "未知",
+  "auth.apiKey": "API 密钥",
+  "apikey.nickname": "昵称",
+  "apikey.optional": "（可选）",
+  "apikey.nicknamePlaceholder": "例如 headless-worker-1",
+  "apikey.keyLabel": "Kiro API 密钥",
+  "apikey.keyMissing": "请输入 Kiro API 密钥",
+  "apikey.success": "已添加 API 密钥账号"
 }

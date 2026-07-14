@@ -884,6 +884,7 @@
     if (normalized === 'idc') return t('auth.enterprise');
     if (normalized === 'social') return t('auth.social');
     if (normalized === 'builderid') return 'BuilderID';
+    if (normalized === 'api_key') return t('auth.apiKey');
     if (normalized === 'github') return t('local.providerGithub');
     if (normalized === 'google') return t('local.providerGoogle');
     return method;
@@ -2078,7 +2079,8 @@
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
-    cookie: 'fa-solid fa-cookie-bite'
+    cookie: 'fa-solid fa-cookie-bite',
+    apikey: 'fa-solid fa-lock'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -2103,6 +2105,7 @@
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
     else if (type === 'cookie') modalCookie(title, body);
+    else if (type === 'apikey') modalApiKey(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -2131,6 +2134,7 @@
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
+      methodCard('apikey', t('modal.apiKeyTitle'), t('modal.apiKeyDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -2287,6 +2291,45 @@
       '</div>';
     $('importCookieBtn').addEventListener('click', importFromCookie);
   }
+  function modalApiKey(title, body) {
+    title.textContent = t('modal.apiKeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apiKeyDesc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + ' <small>' + escapeHtml(t('apikey.optional')) + '</small></label>' +
+      '<input type="text" id="apiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.keyLabel')) + '</label>' +
+      '<input type="text" id="apiKeyValue" class="font-mono" placeholder="ksk_..." /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="apiKeyRegion" value="us-east-1" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApiKeyBtn').addEventListener('click', importApiKey);
+  }
+  async function importApiKey() {
+    const key = $('apiKeyValue').value.trim();
+    if (!key) return toastWarning(t('apikey.keyMissing'));
+    const payload = {
+      authMethod: 'api_key',
+      kiroApiKey: key,
+      nickname: $('apiKeyNickname').value.trim(),
+      region: $('apiKeyRegion').value.trim() || 'us-east-1',
+      enabled: true
+    };
+    try {
+      const res = await api('/accounts', { method: 'POST', body: JSON.stringify(payload) });
+      const d = await res.json();
+      if (d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('apikey.success'));
+        autoRefreshNewAccount(d.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch {
+      toastError(t('common.failed'));
+    }
+  }
   function updateLocalFields() {
     const p = $('localProvider').value;
     $('localClientGroup').classList.toggle('hidden', p === 'Google' || p === 'Github');
@@ -2346,6 +2389,7 @@
             accessToken: c.accessToken || a.accessToken,
             clientId: c.clientId || a.clientId,
             clientSecret: c.clientSecret || a.clientSecret,
+            kiroApiKey: c.kiroApiKey || a.kiroApiKey,
             region: c.region || a.region,
             authMethod: c.authMethod || a.authMethod,
             provider: c.provider || a.provider || a.idp,
@@ -2376,6 +2420,26 @@
     }
     let ok = 0, fail = 0, newIds = [];
     for (const item of items) {
+      // api_key accounts carry a kiroApiKey instead of a refreshToken; route them
+      // straight to the import endpoint's api_key branch.
+      const itemAuth = (item.authMethod || '').toLowerCase();
+      if (itemAuth === 'api_key' || item.kiroApiKey) {
+        if (!item.kiroApiKey) { fail++; continue; }
+        try {
+          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify({
+            authMethod: 'api_key',
+            kiroApiKey: item.kiroApiKey,
+            region: item.region || 'us-east-1',
+            ...(item.id ? { id: item.id } : {}),
+            ...(item.email ? { email: item.email } : {}),
+            ...(item.provider ? { provider: item.provider } : {})
+          }) });
+          const d = await res.json();
+          if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
+          else fail++;
+        } catch { fail++; }
+        continue;
+      }
       if (!item.refreshToken) { fail++; continue; }
       const EXTERNAL_IDP = ['external_idp','azuread','azure','entra','entra-id','microsoft','m365','office365','external'];
       let authMethod = (item.authMethod || '').toLowerCase();

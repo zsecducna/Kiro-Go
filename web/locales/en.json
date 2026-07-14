@@ -1,7 +1,6 @@
 {
   "login.title": "Sign in",
   "login.subtitle": "Enter admin password to continue",
-
   "login.password": "Admin Password",
   "login.passwordPlaceholder": "Enter password",
   "login.submit": "Login",
@@ -227,6 +226,8 @@
   "modal.credentialsDesc": "Add account via Kiro Account Manager exported credentials",
   "modal.cookieTitle": "Kiro Web Cookie",
   "modal.cookieDesc": "Add account via RefreshToken obtained from Kiro Web Cookie",
+  "modal.apiKeyTitle": "API Key",
+  "modal.apiKeyDesc": "Add account via Kiro API key (ksk_...) for headless integration.",
   "modal.enterpriseSsoTitle": "Enterprise SSO - Microsoft 365",
   "modal.enterpriseSsoDesc": "Add a Microsoft 365 / Entra ID (Azure AD) tenant account via Kiro hosted SSO",
   "kirosso.hostNote": "Open the sign-in link on this machine (the same host as the proxy). The browser is redirected through your Microsoft 365 login automatically.",
@@ -496,5 +497,12 @@
   "errors.typeSuspended": "Suspended",
   "errors.typeOverage": "Overage",
   "errors.typeProfile": "Profile",
-  "errors.typeUnknown": "Unknown"
+  "errors.typeUnknown": "Unknown",
+  "auth.apiKey": "API Key",
+  "apikey.nickname": "Nickname",
+  "apikey.optional": "(optional)",
+  "apikey.nicknamePlaceholder": "e.g. headless-worker-1",
+  "apikey.keyLabel": "Kiro API Key",
+  "apikey.keyMissing": "Please enter a Kiro API key",
+  "apikey.success": "API key account added"
 }

@@ -2394,6 +2394,31 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		account.Region = "us-east-1"
 	}
 
+	// Kiro API-key accounts: the key IS the credential. Validate it, normalize the
+	// auth method, and mirror it into AccessToken so pool routing / model refresh
+	// (which gate on a non-empty AccessToken) treat the account as ready. ExpiresAt
+	// stays 0 so the token-refresh paths skip it — API keys are never refreshed.
+	// Detection is case-insensitive (matching IsApiKeyCredential) and also triggers
+	// when a bare kiroApiKey is supplied without an explicit authMethod.
+	account.KiroApiKey = strings.TrimSpace(account.KiroApiKey)
+	if account.IsApiKeyCredential() || account.KiroApiKey != "" {
+		if account.KiroApiKey == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
+			return
+		}
+		// Reject a contradictory payload: a key plus a different, explicit OAuth
+		// method would otherwise be silently rewritten to api_key.
+		if am := strings.TrimSpace(account.AuthMethod); am != "" && !account.IsApiKeyCredential() {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey cannot be combined with authMethod " + am})
+			return
+		}
+		account.AuthMethod = "api_key"
+		account.ExpiresAt = 0
+		account.AccessToken = account.KiroApiKey
+	}
+
 	if err := config.AddAccount(account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -3374,6 +3399,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		RefreshToken string `json:"refreshToken"`
 		ClientID     string `json:"clientId"`
 		ClientSecret string `json:"clientSecret"`
+		KiroApiKey   string `json:"kiroApiKey"`
 		AuthMethod   string `json:"authMethod"`
 		Provider     string `json:"provider"`
 		Region       string `json:"region"`
@@ -3392,6 +3418,49 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	// Kiro API-key accounts short-circuit the OAuth import path: there is no refresh
+	// token to require or refresh. Mirrors apiAddAccount's normalization so backups
+	// exported with a kiroApiKey (or authMethod:"api_key") restore cleanly.
+	req.KiroApiKey = strings.TrimSpace(req.KiroApiKey)
+	if strings.EqualFold(strings.TrimSpace(req.AuthMethod), "api_key") || req.KiroApiKey != "" {
+		if req.KiroApiKey == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
+			return
+		}
+		if req.Region == "" {
+			req.Region = "us-east-1"
+		}
+		id := req.ID
+		if id == "" || config.AccountIDExists(id) {
+			id = auth.GenerateAccountID()
+		}
+		account := config.Account{
+			ID:          id,
+			Email:       req.Email,
+			KiroApiKey:  req.KiroApiKey,
+			AccessToken: req.KiroApiKey, // mirror for pool compatibility (see apiAddAccount)
+			AuthMethod:  "api_key",
+			Provider:    req.Provider,
+			Region:      req.Region,
+			ExpiresAt:   0, // never refreshed
+			Enabled:     true,
+			MachineId:   config.GenerateMachineId(),
+			ProfileArn:  req.ProfileArn,
+		}
+		if err := config.AddAccount(account); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		h.pool.Reload()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"account": map[string]interface{}{"id": account.ID, "email": account.Email},
+		})
 		return
 	}
 
@@ -4228,6 +4297,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		RefreshToken string `json:"refreshToken"`
 		ClientID     string `json:"clientId,omitempty"`
 		ClientSecret string `json:"clientSecret,omitempty"`
+		KiroApiKey   string `json:"kiroApiKey,omitempty"` // Present for api_key accounts so backup/restore round-trips
 		Region       string `json:"region,omitempty"`
 		ExpiresAt    int64  `json:"expiresAt"`
 		AuthMethod   string `json:"authMethod,omitempty"`
@@ -4287,6 +4357,11 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		if authMethod == "idc" {
 			authMethod = "IdC"
 		}
+		// api_key accounts have no OAuth material; keep the lowercase token so the
+		// importer round-trips it back into the same normalization path.
+		if a.IsApiKeyCredential() {
+			authMethod = "api_key"
+		}
 
 		// 映射订阅类型
 		subType := "Free"
@@ -4312,6 +4387,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 				RefreshToken: a.RefreshToken,
 				ClientID:     a.ClientID,
 				ClientSecret: a.ClientSecret,
+				KiroApiKey:   a.KiroApiKey,
 				Region:       a.Region,
 				ExpiresAt:    a.ExpiresAt * 1000, // 转为毫秒时间戳
 				AuthMethod:   authMethod,

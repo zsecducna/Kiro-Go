@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,7 +46,8 @@ type Account struct {
 	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
 	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
 	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), or "external_idp" (enterprise SSO, e.g. Azure AD)
+	KiroApiKey   string `json:"kiroApiKey,omitempty"`   // Kiro API key credential (ksk_...); used directly as the upstream bearer token for headless "api_key" auth. Never refreshed.
+	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), "external_idp" (enterprise SSO, e.g. Azure AD), or "api_key" (headless Kiro API key)
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
 	Region       string `json:"region"`                 // AWS region for OIDC endpoints
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
@@ -115,6 +117,14 @@ type Account struct {
 	LastUsed     int64   `json:"lastUsed,omitempty"`     // Last request timestamp
 	TotalTokens  int     `json:"totalTokens,omitempty"`  // Cumulative tokens processed
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
+}
+
+// IsApiKeyCredential reports whether the account authenticates with a Kiro API
+// key (ksk_...) rather than an OAuth token. Such accounts use KiroApiKey directly
+// as the upstream bearer token, carry a "tokentype: API_KEY" header, and are never
+// token-refreshed (ExpiresAt stays 0).
+func (a *Account) IsApiKeyCredential() bool {
+	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "api_key")
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.

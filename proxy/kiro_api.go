@@ -649,6 +649,15 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 			// Token 相关错误，可能需要重新认证
 			logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", account.Email, err)
 
+			// API-key accounts cannot self-heal: they are never token-refreshed, so a
+			// transient 401/403 on this best-effort usage-info fetch must NOT permanently
+			// ban them (that would brick a valid, paid Kiro API key on one blip). Leave the
+			// account routable — the data-plane path returns a real error to the client if
+			// the key is genuinely dead, and the operator can disable it explicitly.
+			if account.IsApiKeyCredential() {
+				return nil, fmt.Errorf("GetUsageLimits: %w", err)
+			}
+
 			// 更新账户封禁状态为认证失败并自动禁用
 			updatedAccount := *account
 			updatedAccount.Enabled = false

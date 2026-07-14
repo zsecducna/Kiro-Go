@@ -2299,7 +2299,6 @@
       '<input type="text" id="apiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('apikey.keyLabel')) + '</label>' +
       '<input type="text" id="apiKeyValue" class="font-mono" placeholder="ksk_..." /></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="apiKeyRegion" value="us-east-1" /></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
@@ -2309,11 +2308,12 @@
   async function importApiKey() {
     const key = $('apiKeyValue').value.trim();
     if (!key) return toastWarning(t('apikey.keyMissing'));
+    // region intentionally omitted — the server defaults api_key accounts to
+    // us-east-1, and the profile is bound to the key server-side (no region needed).
     const payload = {
       authMethod: 'api_key',
       kiroApiKey: key,
       nickname: $('apiKeyNickname').value.trim(),
-      region: $('apiKeyRegion').value.trim() || 'us-east-1',
       enabled: true
     };
     try {

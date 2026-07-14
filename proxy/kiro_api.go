@@ -261,6 +261,17 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		return profileArn, nil
 	}
 
+	// Kiro API-key (ksk_) accounts are headless: the profile is bound to the key
+	// server-side, so ListAvailableProfiles returns nothing and there is no refresh
+	// token to fall back on. Skip resolution entirely and let callers proceed WITHOUT
+	// a profileArn (getUsageLimits / generateAssistantResponse are key-scoped). This
+	// is a soft skip — isProfileArnResolutionSkippedError matches the message — so
+	// ensureRestProfileArn and the data-plane continue instead of hard-failing, and
+	// it avoids a fruitless multi-region probe on every request.
+	if account.IsApiKeyCredential() {
+		return "", fmt.Errorf("profile ARN resolution skipped: api_key account uses key-bound profile")
+	}
+
 	profileLookupSuppressed := isProfileArnResolutionSuppressed(account)
 	var profileUnsupportedErr error
 	var profileUnsupported bool

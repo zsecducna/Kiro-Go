@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"kiro-go/auth"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"net/http"
 	"strings"
 	"time"
@@ -15,9 +17,10 @@ import (
 // Telegram sales bot). These are authenticated with the ADMIN key (the same
 // password that guards the /admin panel), never with customer API keys:
 //
-//	POST /admin/new_api_key — mint a customer API key with a credit quota
-//	POST /admin/stats       — per-key usage stats, optionally filtered
-//	GET  /admin/pool        — pool credit accounting (available vs sold)
+//	POST /admin/new_api_key      — mint a customer API key with a credit quota
+//	POST /admin/stats            — per-key usage stats, optionally filtered
+//	GET  /admin/pool             — pool credit accounting (available vs sold)
+//	POST /admin/add_kiro_api_key — add a Kiro API key (ksk_) account to the pool
 //
 // The admin key is read from "Authorization: Bearer <key>" or the
 // "X-Admin-Password" header. Deliberately NO cookie fallback: these are
@@ -260,5 +263,104 @@ func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 		},
 		// Headline number: credits still available to sell as new API keys.
 		"sellableCredits": accountsAvailable - soldOutstanding,
+	})
+}
+
+// adminAddKiroApiKeyRequest is the body for POST /admin/add_kiro_api_key.
+type adminAddKiroApiKeyRequest struct {
+	KiroApiKey string `json:"kiroApiKey"`         // The Kiro API key (ksk_...); required
+	Nickname   string `json:"nickname,omitempty"` // Optional label for the admin panel
+	Region     string `json:"region,omitempty"`   // AWS region (default us-east-1)
+	Enabled    *bool  `json:"enabled,omitempty"`  // Whether to route traffic immediately (default true)
+}
+
+// handleAdminAddKiroApiKey POST /admin/add_kiro_api_key — add a Kiro API key
+// (ksk_) account to the upstream pool. This is the supply-side counterpart to
+// /admin/new_api_key (which mints customer keys): the Telegram bot uses it to
+// provision the Kiro capacity that backs the keys it sells. Normalizes the
+// account exactly like the admin-panel add-account flow (AuthMethod=api_key,
+// AccessToken mirrored, ExpiresAt=0 so it is never token-refreshed).
+func (h *Handler) handleAdminAddKiroApiKey(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	var req adminAddKiroApiKeyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	req.KiroApiKey = strings.TrimSpace(req.KiroApiKey)
+	if req.KiroApiKey == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
+		return
+	}
+	// The route contract is Kiro API keys; a strict prefix check protects against a
+	// bot bug posting an order ID or OAuth blob, which would otherwise become a
+	// permanently-broken pool account that only surfaces as upstream 403s.
+	if !strings.HasPrefix(req.KiroApiKey, "ksk_") {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey must start with ksk_"})
+		return
+	}
+
+	// Idempotency: the caller is an automated bot whose normal failure mode is a
+	// timeout + retry. Deduplicate on the key value so a retry doesn't create a
+	// second pool account backed by the same upstream key (which would double its
+	// routing weight and burn rate). Return the existing account's ID instead.
+	for _, existing := range config.GetAccounts() {
+		if existing.KiroApiKey == req.KiroApiKey {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":   true,
+				"id":        existing.ID,
+				"enabled":   existing.Enabled,
+				"duplicate": true,
+			})
+			return
+		}
+	}
+
+	region := strings.TrimSpace(req.Region)
+	if region == "" {
+		region = "us-east-1"
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	account := config.Account{
+		ID:          auth.GenerateAccountID(),
+		Nickname:    strings.TrimSpace(req.Nickname),
+		KiroApiKey:  req.KiroApiKey,
+		AccessToken: req.KiroApiKey, // mirror for pool compatibility (see apiAddAccount)
+		AuthMethod:  "api_key",
+		Region:      region,
+		ExpiresAt:   0, // never refreshed
+		Enabled:     enabled,
+		MachineId:   config.GenerateMachineId(),
+	}
+
+	if err := config.AddAccount(account); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
+	// Warm the model cache in the background when the account is live, mirroring
+	// apiAddAccount; failures are logged, not fatal to the add.
+	if enabled {
+		go func(acc config.Account) {
+			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+				logger.Warnf("[ModelsCache] Auto-refresh failed for new Kiro API key account %s: %v", acc.ID, err)
+			}
+		}(account)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"id":      account.ID,
+		"enabled": enabled,
 	})
 }

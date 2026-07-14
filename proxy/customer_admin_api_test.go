@@ -280,6 +280,76 @@ func TestAdminStatsFilters(t *testing.T) {
 	}
 }
 
+func TestAdminAddKiroApiKey(t *testing.T) {
+	mustInitConfig(t)
+	config.SetPassword("topsecret")
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+
+	// Missing key → 400.
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key", `{"kiroApiKey":"  "}`, "topsecret")); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty key, got %d", rec.Code)
+	}
+
+	// Wrong prefix → 400.
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key", `{"kiroApiKey":"order-123"}`, "topsecret")); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-ksk_ key, got %d", rec.Code)
+	}
+
+	// Wrong admin key → 401.
+	if rec := serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key", `{"kiroApiKey":"ksk_x"}`, "wrong")); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with wrong admin key, got %d", rec.Code)
+	}
+
+	// Valid add (enabled:false to avoid the live model-fetch goroutine).
+	rec := serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key",
+		`{"kiroApiKey":"ksk_pool1","nickname":"cap-1","region":"eu-west-1","enabled":false}`, "topsecret"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["success"] != true || body["enabled"] != false {
+		t.Fatalf("unexpected response: %v", body)
+	}
+
+	var stored *config.Account
+	all := config.GetAccounts()
+	for i := range all {
+		if all[i].KiroApiKey == "ksk_pool1" {
+			stored = &all[i]
+			break
+		}
+	}
+	if stored == nil {
+		t.Fatal("kiro api key account not persisted")
+	}
+	if body["id"] != stored.ID {
+		t.Fatalf("response id %v != stored id %s", body["id"], stored.ID)
+	}
+	if !stored.IsApiKeyCredential() || stored.AccessToken != "ksk_pool1" || stored.ExpiresAt != 0 ||
+		stored.Region != "eu-west-1" || stored.Nickname != "cap-1" || stored.Enabled {
+		t.Fatalf("account not normalized: %+v", stored)
+	}
+
+	// Idempotent retry: same key → same id, duplicate flag, no second account.
+	rec = serve(h, adminReq(http.MethodPost, "/admin/add_kiro_api_key",
+		`{"kiroApiKey":"ksk_pool1","enabled":false}`, "topsecret"))
+	dupBody := decodeBody(t, rec)
+	if dupBody["duplicate"] != true || dupBody["id"] != stored.ID {
+		t.Fatalf("expected idempotent duplicate, got %v", dupBody)
+	}
+	count := 0
+	for _, a := range config.GetAccounts() {
+		if a.KiroApiKey == "ksk_pool1" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 account for the key, got %d", count)
+	}
+}
+
 func TestAdminPoolMath(t *testing.T) {
 	mustInitConfig(t)
 	config.SetPassword("topsecret")

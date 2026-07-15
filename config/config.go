@@ -595,6 +595,24 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	return fmt.Errorf("account not found: %s", id)
 }
 
+// UpdateAccountRegion persists a re-detected data-plane region for an account.
+// Used by the api_key region auto-detection path (proxy.reprobeApiKeyRegion): a
+// ksk_ key is bound to the region it was minted in, so when a call is rejected as
+// an invalid bearer token in the stored region the caller probes other regions and
+// persists the one that works here, so future calls target it directly. A missing
+// id is an error so callers cannot mistake a no-op for a successful write.
+func UpdateAccountRegion(id, region string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].Region = region
+			return Save()
+		}
+	}
+	return fmt.Errorf("account not found: %s", id)
+}
+
 func DeleteAccount(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()

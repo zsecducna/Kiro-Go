@@ -148,6 +148,53 @@ func shouldProbeFallbackRegions(account *config.Account) bool {
 	return strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp")
 }
 
+// reprobeApiKeyRegion re-detects the data-plane region for a Kiro API-key account
+// after an upstream auth failure (typically "HTTP 403 ... bearer token invalid").
+// A ksk_ key is bound to the region it was minted in, so a request sent to the wrong
+// region is rejected as an invalid bearer token even though the key is perfectly
+// valid elsewhere. The stored region can be wrong when the account was imported
+// without a region probe, or the key was later re-issued in a different region.
+//
+// It probes each candidate region (skipping the one that just failed) using the same
+// key-validating probe the "add Kiro API key" flow uses, and on the first region that
+// accepts the key it persists the new region to config + the in-memory account and
+// returns it. Returns ("", false) when no other region accepts the key (the key is
+// genuinely dead / revoked) so the caller surfaces the original auth error unchanged.
+func reprobeApiKeyRegion(account *config.Account) (string, bool) {
+	if account == nil || !account.IsApiKeyCredential() {
+		return "", false
+	}
+	key := strings.TrimSpace(account.KiroApiKey)
+	if key == "" {
+		return "", false
+	}
+	current := normalizeRegion(account.Region)
+	for _, region := range kiroApiKeyCandidateRegions() {
+		if normalizeRegion(region) == current {
+			continue
+		}
+		info, err := probeKiroApiKey(key, region)
+		if err != nil {
+			logger.Debugf("[KiroAPI] api_key region probe failed for %s in %s: %v", accountEmailForLog(account), region, err)
+			continue
+		}
+		// This region accepts the key. Persist it so subsequent calls target it
+		// directly and no longer trip the auth-error → reprobe path.
+		account.Region = region
+		if updateErr := config.UpdateAccountRegion(account.ID, region); updateErr != nil {
+			logger.Warnf("[KiroAPI] failed to persist re-detected region %s for %s: %v", region, accountEmailForLog(account), updateErr)
+		}
+		if info != nil {
+			if infoErr := config.UpdateAccountInfo(account.ID, *info); infoErr != nil {
+				logger.Debugf("[KiroAPI] failed to persist account info after region re-detect for %s: %v", accountEmailForLog(account), infoErr)
+			}
+		}
+		logger.Infof("[KiroAPI] api_key account %s re-detected region %s after auth error", accountEmailForLog(account), region)
+		return region, true
+	}
+	return "", false
+}
+
 // GetUsageLimits 获取账户使用量和订阅信息
 func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 	if err := ensureRestProfileArn(account); err != nil {

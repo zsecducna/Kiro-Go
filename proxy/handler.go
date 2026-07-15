@@ -452,6 +452,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleAdminAddKiroApiKey(w, r)
+	case path == "/admin/add_kiro_account" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminAddKiroAccount(w, r)
 
 	// 管理端点
 	case path == "/admin" || path == "/admin/":

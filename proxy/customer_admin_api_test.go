@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // seedKey adds an API key entry with the given quota/usage and returns it.
@@ -1114,5 +1115,167 @@ func TestAdminAddKiroAccountRequiresProfileArn(t *testing.T) {
 	}
 	if len(config.GetAccounts()) != 0 {
 		t.Fatalf("nothing should be persisted, got %d", len(config.GetAccounts()))
+	}
+}
+
+// --- Pool census --------------------------------------------------------
+
+// seedAccount adds a pool account with the given identity/state.
+func seedAccount(t *testing.T, id, userID, email, banStatus string, enabled bool) {
+	t.Helper()
+	if err := config.AddAccount(config.Account{
+		ID:           id,
+		UserId:       userID,
+		Email:        email,
+		Enabled:      enabled,
+		BanStatus:    banStatus,
+		AuthMethod:   "external_idp",
+		AccessToken:  "at-" + id,
+		RefreshToken: "rt-" + id,
+		Region:       "us-east-1",
+		UsageLimit:   1000,
+		UsageCurrent: 0,
+	}); err != nil {
+		t.Fatalf("AddAccount(%s): %v", id, err)
+	}
+}
+
+func poolStates(t *testing.T, body map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	st, ok := body["accountStates"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("no accountStates in body: %v", body)
+	}
+	return st
+}
+
+// The census must count from the FULL config: the pool only ever holds enabled,
+// routable rows, so a banned account is invisible to it and `accounts.total`
+// undercounts real inventory.
+func TestAdminPoolCensusCountsBannedFromConfig(t *testing.T) {
+	mustInitConfig(t)
+	config.SetPassword("topsecret")
+
+	seedAccount(t, "acc-live", "user-live", "live@x.com", "ACTIVE", true)
+	seedAccount(t, "acc-banned", "user-banned", "banned@x.com", "BANNED", false)
+	// SUSPENDED is defensive: no writer emits it today (the failover path writes
+	// BANNED with a "suspended" reason), but config documents it as a ban state.
+	seedAccount(t, "acc-susp", "user-susp", "susp@x.com", "SUSPENDED", false)
+	seedAccount(t, "acc-off", "user-off", "off@x.com", "DISABLED", false)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+
+	rec := serve(h, adminReq(http.MethodGet, "/admin/pool", "", "topsecret"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	st := poolStates(t, decodeBody(t, rec))
+	for _, tc := range []struct {
+		field string
+		want  float64
+	}{
+		{"active", 1},
+		{"banned", 2}, // BANNED + SUSPENDED
+		{"disabled", 1},
+		{"total", 4}, // inventory, NOT the pool's enabled-row count
+	} {
+		if got := st[tc.field].(float64); got != tc.want {
+			t.Fatalf("%s: want %v, got %v (states=%v)", tc.field, tc.want, got, st)
+		}
+	}
+	// The pool's own view can't see the banned/disabled stock at all — which is
+	// exactly why the census reads config instead.
+	acc := decodeBody(t, rec)["accounts"].(map[string]interface{})
+	if acc["total"].(float64) != 1 {
+		t.Fatalf("pool total should only count enabled rows, got %v", acc["total"])
+	}
+}
+
+// /admin/pool must never make an upstream call: it is also the customer buy-path
+// headroom gate (kiro_go_sellable_credits) with a 5s client timeout, so live I/O
+// here would put unbounded latency in front of purchases and fail the cap open.
+func TestAdminPoolCensusMakesNoUpstreamCall(t *testing.T) {
+	mustInitConfig(t)
+	config.SetPassword("topsecret")
+	seedAccount(t, "acc-banned", "user-banned", "banned@x.com", "BANNED", false)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+
+	origProbe := probeKiroApiKey
+	defer func() { probeKiroApiKey = origProbe }()
+	probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
+		t.Errorf("/admin/pool must not probe upstream")
+		return nil, errTest("unexpected probe")
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		done <- serve(h, adminReq(http.MethodGet, "/admin/pool", "", "topsecret")).Code
+	}()
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("/admin/pool blocked >2s — it must be a pure read")
+	}
+}
+
+// An enabled account the pool dropped (quota-blocked) or that is cooling down is
+// not dead stock — it must read as cooldown, not active.
+func TestAdminPoolCensusCountsCooldown(t *testing.T) {
+	mustInitConfig(t)
+	config.SetPassword("topsecret")
+	// Enabled but quota-exhausted → Reload drops it → not pool-resident.
+	if err := config.AddAccount(config.Account{
+		ID: "acc-spent", UserId: "user-spent", Email: "spent@x.com",
+		Enabled: true, UsageLimit: 1000, UsageCurrent: 1000,
+	}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	seedAccount(t, "acc-live", "user-live", "live@x.com", "ACTIVE", true)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+
+	st := poolStates(t, decodeBody(t, serve(h, adminReq(http.MethodGet, "/admin/pool", "", "topsecret"))))
+	if st["cooldown"].(float64) != 1 {
+		t.Fatalf("quota-blocked account must read as cooldown, got %v", st)
+	}
+	if st["active"].(float64) != 1 {
+		t.Fatalf("expected active=1, got %v", st)
+	}
+}
+
+// Multi-region rows are one identity. The census collapses them to their BEST
+// state, and the counts must partition the inventory.
+func TestAdminPoolCensusDedupesIdentityToBestState(t *testing.T) {
+	mustInitConfig(t)
+	config.SetPassword("topsecret")
+	// Same Kiro identity, two region rows: one banned, one serving.
+	seedAccount(t, "acc-r1", "user-multi", "multi@x.com", "BANNED", false)
+	seedAccount(t, "acc-r2", "user-multi", "multi@x.com", "ACTIVE", true)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+
+	st := poolStates(t, decodeBody(t, serve(h, adminReq(http.MethodGet, "/admin/pool", "", "topsecret"))))
+	if st["total"].(float64) != 1 {
+		t.Fatalf("two rows of one identity must count once, got total=%v", st["total"])
+	}
+	// It is serving from one region, so it is active — not banned.
+	if st["active"].(float64) != 1 || st["banned"].(float64) != 0 {
+		t.Fatalf("identity with a live row must read active: %v", st)
+	}
+	sum := st["active"].(float64) + st["cooldown"].(float64) + st["banned"].(float64) + st["disabled"].(float64)
+	if sum != st["total"].(float64) {
+		t.Fatalf("census must partition inventory: sum=%v total=%v (%v)", sum, st["total"], st)
 	}
 }

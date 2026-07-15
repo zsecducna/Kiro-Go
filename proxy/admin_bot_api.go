@@ -376,6 +376,12 @@ func (h *Handler) handleAdminBotStats(w http.ResponseWriter, r *http.Request) {
 // account's UsageCurrent and the key's CreditsUsed by the same credits, so both
 // terms shrink together and sellableCredits only moves when accounts are
 // added/reset or keys are sold/expired.
+// isBannedStatus reports whether a BanStatus means "upstream rejected this
+// account", as opposed to "DISABLED" — an operator/quota decision.
+func isBannedStatus(status string) bool {
+	return strings.EqualFold(status, "BANNED") || strings.EqualFold(status, "SUSPENDED")
+}
+
 func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
@@ -391,7 +397,7 @@ func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 	for _, acc := range accounts {
 		// Skip unusable rows BEFORE claiming the identity slot, so a dead row
 		// encountered first doesn't shadow a healthy same-account row behind it.
-		if !acc.Enabled || strings.EqualFold(acc.BanStatus, "BANNED") || strings.EqualFold(acc.BanStatus, "SUSPENDED") {
+		if !acc.Enabled || isBannedStatus(acc.BanStatus) {
 			continue
 		}
 		dedupeKey := strings.TrimSpace(acc.UserId)
@@ -409,6 +415,77 @@ func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 			accountsAvailable += rem
 		}
 	}
+
+	// --- Account census. The pool itself only ever holds ENABLED, routable rows
+	// (Reload -> GetEnabledAccounts, minus quota-blocked), and banning an account
+	// disables it — so a banned account is invisible to every field above, and
+	// `accounts.total` counts only what's enabled, not what's owned. Census the
+	// FULL config so the operator can see dead stock and real inventory.
+	//
+	// Deduped on the underlying Kiro identity (same key as the credit maths), so
+	// one account with several region rows counts once. When those rows disagree
+	// the BEST state wins — an identity still serving from one region is active,
+	// whatever a sibling row says.
+	poolResident := make(map[string]bool, len(accounts))
+	for _, acc := range accounts {
+		poolResident[acc.ID] = true
+	}
+	degraded := make(map[string]bool)
+	for _, s := range h.pool.HealthSnapshots() {
+		if s.CooldownActive || s.Circuit != "closed" {
+			degraded[s.ID] = true
+		}
+	}
+	// Lower rank = healthier; used to collapse an identity's rows to one state.
+	const (
+		stActive = iota
+		stCooldown
+		stDisabled
+		stBanned
+	)
+	bestState := make(map[string]int)
+	for _, a := range config.GetAccounts() {
+		key := strings.TrimSpace(a.UserId)
+		if key == "" {
+			key = a.ID
+		}
+		st := stActive
+		switch {
+		case isBannedStatus(a.BanStatus):
+			// NOTE: a ban is a STICKY label, not a live verdict. It is written by the
+			// request/refresh paths on an upstream error and nothing ever re-checks
+			// it (reprobeDisabled only revisits BanStatus=="DISABLED"), so this count
+			// can include accounts upstream has since forgiven. Confirming a ban needs
+			// a Kiro-API probe (refresh token, then GetUsageLimits) — a token refresh
+			// alone is not a probe: auth.RefreshToken short-circuits on a live token
+			// and returns success without contacting anyone.
+			st = stBanned
+		case !a.Enabled:
+			st = stDisabled
+		case !poolResident[a.ID] || degraded[a.ID]:
+			// Enabled but not dispatching: quota-blocked (Reload dropped it), in
+			// cooldown, or its circuit is open. All are self-healing, so they read
+			// as cooldown rather than as dead stock.
+			st = stCooldown
+		}
+		if cur, ok := bestState[key]; !ok || st < cur {
+			bestState[key] = st
+		}
+	}
+	census := map[string]int{"active": 0, "cooldown": 0, "banned": 0, "disabled": 0}
+	for _, st := range bestState {
+		switch st {
+		case stActive:
+			census["active"]++
+		case stCooldown:
+			census["cooldown"]++
+		case stDisabled:
+			census["disabled"]++
+		case stBanned:
+			census["banned"]++
+		}
+	}
+	census["total"] = len(bestState)
 
 	// --- Sold side. Only enabled keys hold outstanding quota: exhausted keys
 	// are auto-disabled with ~0 remaining, and manually disabled keys can't
@@ -444,6 +521,17 @@ func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 			"creditsLimit":     accountsTotal,
 			"creditsUsed":      accountsUsed,
 			"creditsAvailable": accountsAvailable,
+		},
+		// Inventory census over the FULL account config, deduped per Kiro identity.
+		// Distinct from "accounts" above, which only sees pool-resident (enabled,
+		// routable) rows and so can neither see banned stock nor report a true total.
+		// Counts partition the inventory: active+cooldown+banned+disabled == total.
+		"accountStates": map[string]interface{}{
+			"active":   census["active"],
+			"cooldown": census["cooldown"],
+			"banned":   census["banned"],
+			"disabled": census["disabled"],
+			"total":    census["total"],
 		},
 		"sold": map[string]interface{}{
 			"activeKeys":         activeKeys,

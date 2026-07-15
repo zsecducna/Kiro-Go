@@ -141,11 +141,13 @@
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
     qsa('.lang-toggle').forEach(btn => {
       const label = btn.querySelector('.lang-toggle-label');
-      if (label) label.textContent = currentLang === 'zh' ? t('lang.zh') : t('lang.en');
+      if (label) label.textContent = t('lang.' + currentLang);
     });
   }
   function toggleLang() {
-    setLang(currentLang === 'zh' ? 'en' : 'zh');
+    const order = ['zh', 'en', 'vi'];
+    const idx = order.indexOf(currentLang);
+    setLang(order[(idx + 1) % order.length]);
   }
 
   // Custom select
@@ -3233,10 +3235,10 @@
     const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
     const parts = [];
-    if (d > 0) parts.push(d + (currentLang === 'zh' ? '天' : 'd'));
-    if (h > 0) parts.push(h + (currentLang === 'zh' ? '时' : 'h'));
-    if (m > 0) parts.push(m + (currentLang === 'zh' ? '分' : 'm'));
-    parts.push(s + (currentLang === 'zh' ? '秒' : 's'));
+    if (d > 0) parts.push(d + t('uptime.d'));
+    if (h > 0) parts.push(h + t('uptime.h'));
+    if (m > 0) parts.push(m + t('uptime.m'));
+    parts.push(s + t('uptime.s'));
     return parts.join(' ');
   }
 
@@ -3321,7 +3323,7 @@
       gemini: 'Gemini (Google)',
       meta: 'LLaMA (Meta)',
       proxy: 'Proxy Aliases',
-      other: currentLang === 'zh' ? '其他模型' : 'Other'
+      other: t('models.familyOther')
     };
     return labels[family] || family;
   }

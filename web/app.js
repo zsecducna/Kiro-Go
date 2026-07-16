@@ -2312,8 +2312,10 @@
   async function importApiKey() {
     const key = $('apiKeyValue').value.trim();
     if (!key) return toastWarning(t('apikey.keyMissing'));
-    // region intentionally omitted — the server defaults api_key accounts to
-    // us-east-1, and the profile is bound to the key server-side (no region needed).
+    // region intentionally omitted — the server probes the candidate regions and
+    // pins the one the key actually serves. The profile is bound to the key
+    // server-side, but the data-plane endpoint is still regional, so the region
+    // must be discovered rather than assumed (an EU key 403s against us-east-1).
     const payload = {
       authMethod: 'api_key',
       kiroApiKey: key,

@@ -2456,9 +2456,6 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	if account.ID == "" {
 		account.ID = auth.GenerateAccountID()
 	}
-	if account.Region == "" {
-		account.Region = "us-east-1"
-	}
 
 	// Kiro API-key accounts: the key IS the credential. Validate it, normalize the
 	// auth method, and mirror it into AccessToken so pool routing / model refresh
@@ -2483,6 +2480,36 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		account.AuthMethod = "api_key"
 		account.ExpiresAt = 0
 		account.AccessToken = account.KiroApiKey
+		// Discover the region the key actually serves. The panel deliberately omits
+		// region for api_key adds, so without this an EU-provisioned key would inherit
+		// the us-east-1 default below and 403 on every upstream call, permanently.
+		// A transient upstream failure must not be reported as a bad key, so it maps
+		// to 502 (retry) rather than 400 (caller error).
+		region, info, retryable, err := resolveApiKeyRegion(account.KiroApiKey, account.Region)
+		if err != nil {
+			status := 400
+			if retryable {
+				status = 502
+			}
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		account.Region = region
+		// The probe already paid for the identity round-trip; keep it so the account
+		// shows a real email in the panel and can be deduplicated by UserId later.
+		if info != nil {
+			if account.Email == "" {
+				account.Email = info.Email
+			}
+			if account.UserId == "" {
+				account.UserId = info.UserId
+			}
+		}
+	}
+
+	if account.Region == "" {
+		account.Region = "us-east-1"
 	}
 
 	if err := config.AddAccount(account); err != nil {
@@ -3497,8 +3524,33 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
 			return
 		}
-		if req.Region == "" {
-			req.Region = "us-east-1"
+		// Same region trap as apiAddAccount: a region-less record must be probed rather
+		// than defaulted to us-east-1, and an exported region is validated against the
+		// key rather than trusted — api_key accounts never re-probe, so a stale or
+		// mistyped region would restore as a permanently-403ing pool slot.
+		region, info, retryable, err := resolveApiKeyRegion(req.KiroApiKey, req.Region)
+		if err != nil {
+			status := 400
+			if retryable {
+				status = 502
+			}
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		req.Region = region
+		// Prefer the identity supplied by the caller (a full account record), falling
+		// back to what the probe just fetched. UserId matters beyond display: it is how
+		// findAccountForKiroIdentity recognizes two keys minted by the same Kiro
+		// account, so an imported slot without it gets duplicated by a later supply-side
+		// add (double routing weight, double-counted quota) until a refresh backfills it.
+		if info != nil {
+			if req.Email == "" {
+				req.Email = info.Email
+			}
+			if req.UserID == "" {
+				req.UserID = info.UserId
+			}
 		}
 		id := req.ID
 		if id == "" || config.AccountIDExists(id) {
@@ -3507,6 +3559,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		account := config.Account{
 			ID:          id,
 			Email:       req.Email,
+			UserId:      req.UserID,
 			KiroApiKey:  req.KiroApiKey,
 			AccessToken: req.KiroApiKey, // mirror for pool compatibility (see apiAddAccount)
 			AuthMethod:  "api_key",

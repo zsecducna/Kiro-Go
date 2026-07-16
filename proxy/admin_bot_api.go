@@ -4,10 +4,12 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	"os"
 	"strings"
@@ -806,6 +808,46 @@ var probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
 		return nil, err
 	}
 	return info, nil
+}
+
+// resolveApiKeyRegion determines the data-plane region a ksk_ key actually serves,
+// returning the region plus the account identity the probe fetched on the way.
+//
+// The Kiro profile is bound to the key server-side, but the data-plane endpoint is
+// regional (getUsageLimits lives on q.{region}.amazonaws.com), so a key only answers
+// in its home region. A wrong region is unrecoverable: api_key accounts never
+// re-probe, because ResolveProfileArn short-circuits for key-bound profiles. So the
+// region is never assumed — an explicit region narrows the probe set to that one
+// region (validating the caller's claim without overriding it), and an empty region
+// probes every candidate. This mirrors handleAdminAddKiroApiKey's probe semantics so
+// the panel, the import path and the bot route cannot disagree about what a usable
+// key is. They still differ on how they REPORT an unusable one: the bot route answers
+// 502 unconditionally (a stable contract its callers depend on), while the callers of
+// this helper split 400/502 on the bool below.
+//
+// The bool reports whether the failure looks retryable: false means every probe was
+// an auth rejection (the key genuinely does not serve those regions — a caller
+// error), true means at least one probe failed for a transient reason (upstream 5xx,
+// timeout, proxy outage), which must not be reported as a bad key.
+func resolveApiKeyRegion(key, explicitRegion string) (string, *config.AccountInfo, bool, error) {
+	targetRegions := kiroApiKeyCandidateRegions()
+	if explicit := strings.TrimSpace(explicitRegion); explicit != "" {
+		targetRegions = []string{explicit}
+	}
+
+	var errs []string
+	retryable := false
+	for _, region := range targetRegions {
+		info, err := probeKiroApiKey(key, region)
+		if err == nil {
+			return region, info, false, nil
+		}
+		if !pool.IsAuthFailure(err) {
+			retryable = true
+		}
+		errs = append(errs, region+": "+err.Error())
+	}
+	return "", nil, retryable, fmt.Errorf("kiroApiKey not usable in any probed region (%s)", strings.Join(errs, "; "))
 }
 
 // adminAddKiroAccountRequest is the body for POST /admin/add_kiro_account.

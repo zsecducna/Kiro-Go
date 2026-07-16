@@ -47,10 +47,28 @@ const forwardHeader = "X-KiroGo-Forwarded"
 // upstream returned a non-2xx status (bad/expired key).
 type customApiQuota struct {
 	CreditsRemaining float64
+	CreditsUsed      float64
 	TokensRemaining  int64
+	TokensUsed       int64
 	CreditLimit      float64
 	TokenLimit       int64
 	OK               bool
+}
+
+// toAccountInfo maps an upstream /api/me quota onto the AccountInfo usage fields the
+// admin panel renders (main quota = usageCurrent/usageLimit). Credit-based, matching
+// how these accounts are sold. now is the LastRefresh timestamp.
+func (q *customApiQuota) toAccountInfo(now int64) config.AccountInfo {
+	info := config.AccountInfo{
+		SubscriptionType: "Custom API",
+		UsageCurrent:     q.CreditsUsed,
+		UsageLimit:       q.CreditLimit,
+		LastRefresh:      now,
+	}
+	if q.CreditLimit > 0 {
+		info.UsagePercent = q.CreditsUsed / q.CreditLimit
+	}
+	return info
 }
 
 // probeCustomApiQuota calls {baseURL}/api/me with the supplied bearer token and
@@ -79,7 +97,9 @@ var probeCustomApiQuota = func(baseURL, apiKey string) (*customApiQuota, error) 
 	}
 	var raw struct {
 		CreditsRemaining float64 `json:"creditsRemaining"`
+		CreditsUsed      float64 `json:"creditsUsed"`
 		TokensRemaining  int64   `json:"tokensRemaining"`
+		TokensUsed       int64   `json:"tokensUsed"`
 		CreditLimit      float64 `json:"creditLimit"`
 		TokenLimit       int64   `json:"tokenLimit"`
 	}
@@ -88,7 +108,9 @@ var probeCustomApiQuota = func(baseURL, apiKey string) (*customApiQuota, error) 
 	}
 	return &customApiQuota{
 		CreditsRemaining: raw.CreditsRemaining,
+		CreditsUsed:      raw.CreditsUsed,
 		TokensRemaining:  raw.TokensRemaining,
+		TokensUsed:       raw.TokensUsed,
 		CreditLimit:      raw.CreditLimit,
 		TokenLimit:       raw.TokenLimit,
 		OK:               true,

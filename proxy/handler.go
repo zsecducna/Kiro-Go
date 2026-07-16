@@ -289,10 +289,15 @@ func (h *Handler) refreshAllAccounts() {
 		if !account.Enabled || account.AccessToken == "" {
 			continue
 		}
-		// Custom API accounts are transparent proxies to another Kiro-Go pool: they
-		// have no Kiro token to refresh and no Kiro usage to fetch. Probing them
-		// against AWS with their mirrored upstream key would 403 and auto-ban them.
+		// Custom API accounts have no Kiro token/usage: refresh their quota from the
+		// linked upstream pool's /api/me instead of AWS (which would 403 and auto-ban).
 		if account.IsCustomApi() {
+			quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
+			if err != nil {
+				logger.Warnf("[BackgroundRefresh] custom_api quota fetch failed for %s: %v", account.ID, err)
+				continue
+			}
+			config.UpdateAccountInfo(account.ID, quota.toAccountInfo(time.Now().Unix()))
 			continue
 		}
 
@@ -4183,15 +4188,20 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 	// re-validating the upstream key against its /api/me quota and reloading the model
 	// list from the upstream /v1/models — never a Kiro/AWS call.
 	if account.IsCustomApi() {
-		if _, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey); err != nil {
+		quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
+		if err != nil {
 			w.WriteHeader(502)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
+		info := quota.toAccountInfo(time.Now().Unix())
+		if updateErr := config.UpdateAccountInfo(id, info); updateErr != nil {
+			logger.Warnf("[Refresh] custom_api quota persist failed for %s: %v", account.ID, updateErr)
+		}
 		if err := h.fetchAndCacheAccountModels(account); err != nil {
 			logger.Warnf("[Refresh] custom_api model reload failed for %s: %v", account.ID, err)
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "custom_api upstream reachable"})
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "info": info})
 		return
 	}
 

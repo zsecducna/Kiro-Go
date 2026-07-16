@@ -1275,6 +1275,11 @@ func (h *Handler) addCustomApiAccount(req adminAddCustomApiRequest) (string, int
 	if err := config.AddAccount(account); err != nil {
 		return "", http.StatusInternalServerError, err
 	}
+	// Persist the upstream quota (already fetched above) so /admin/pool and the panel
+	// show it immediately, not only after the next background refresh.
+	if updateErr := config.UpdateAccountInfo(account.ID, quota.toAccountInfo(time.Now().Unix())); updateErr != nil {
+		logger.Warnf("[AddCustomApi] failed to persist quota for %s: %v", account.ID, updateErr)
+	}
 	h.pool.Reload()
 	return account.ID, http.StatusOK, nil
 }

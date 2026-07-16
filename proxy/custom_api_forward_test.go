@@ -196,6 +196,25 @@ func TestCustomApiChargesCredits(t *testing.T) {
 	}
 }
 
+// Upstream /api/me credits map onto the panel's main-quota fields.
+func TestCustomApiQuotaToAccountInfo(t *testing.T) {
+	q := &customApiQuota{CreditsUsed: 25, CreditLimit: 100, OK: true}
+	info := q.toAccountInfo(12345)
+	if info.UsageCurrent != 25 || info.UsageLimit != 100 {
+		t.Fatalf("usage: %+v", info)
+	}
+	if info.UsagePercent < 0.249 || info.UsagePercent > 0.251 {
+		t.Fatalf("percent: %v", info.UsagePercent)
+	}
+	if info.LastRefresh != 12345 || info.SubscriptionType != "Custom API" {
+		t.Fatalf("meta: %+v", info)
+	}
+	// Unlimited (limit 0) → no percent, no div-by-zero.
+	if u := (&customApiQuota{CreditsUsed: 5, CreditLimit: 0, OK: true}).toAccountInfo(1); u.UsagePercent != 0 {
+		t.Fatalf("unlimited percent should be 0, got %v", u.UsagePercent)
+	}
+}
+
 // Model list comes from the upstream provider's /v1/models, not Kiro.
 func TestProbeCustomApiModels(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

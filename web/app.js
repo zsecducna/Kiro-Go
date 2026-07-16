@@ -889,6 +889,7 @@
     if (normalized === 'social') return t('auth.social');
     if (normalized === 'builderid') return 'BuilderID';
     if (normalized === 'api_key') return t('auth.apiKey');
+    if (normalized === 'custom_api') return t('auth.customApi');
     if (normalized === 'github') return t('local.providerGithub');
     if (normalized === 'google') return t('local.providerGoogle');
     return method;
@@ -1248,7 +1249,11 @@
       detailItem(t('detail.email'), getDisplayEmail(a.email, null)) +
       detailItem(t('detail.userId'), a.userId || '-') +
       detailItem(t('detail.authMethod'), formatAuthMethod(a.provider || a.authMethod)) +
-      detailItem(t('detail.region'), a.region || 'us-east-1') +
+      (a.authMethod === 'custom_api'
+        ? detailItem(t('customApi.baseUrl'), a.baseUrl || '-') +
+          detailItem(t('customApi.orderId'), a.orderId || '-') +
+          detailItem(t('customApi.tags'), (a.tags && a.tags.length) ? a.tags.join(', ') : '-')
+        : detailItem(t('detail.region'), a.region || 'us-east-1')) +
       '</div></div>' +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.machineId')) + '</h4><div class="machine-id-row">' +
@@ -2110,6 +2115,7 @@
     else if (type === 'credentials') modalCredentials(title, body);
     else if (type === 'cookie') modalCookie(title, body);
     else if (type === 'apikey') modalApiKey(title, body);
+    else if (type === 'customapi') modalCustomApi(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -2139,6 +2145,7 @@
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
       methodCard('apikey', t('modal.apiKeyTitle'), t('modal.apiKeyDesc')) +
+      methodCard('customapi', t('modal.customApiTitle'), t('modal.customApiDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -2328,6 +2335,51 @@
       if (d.success) {
         closeModal(); loadAccounts(); loadStats();
         toastPrimary(t('apikey.success'));
+        autoRefreshNewAccount(d.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch {
+      toastError(t('common.failed'));
+    }
+  }
+  // modalCustomApi renders the "Custom API" (pool-linking) add form. A Custom API
+  // account is a transparent proxy to ANOTHER Kiro-Go pool: base URL + a key that
+  // pool issued to us. The server validates order id, dedup, and upstream quota.
+  function modalCustomApi(title, body) {
+    title.textContent = t('modal.customApiTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.customApiDesc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('customApi.baseUrl')) + '</label>' +
+      '<input type="text" id="customApiBaseUrl" class="font-mono" placeholder="https://pool.example.com" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('customApi.apiKey')) + '</label>' +
+      '<input type="text" id="customApiKey" class="font-mono" placeholder="sk-..." /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('customApi.orderId')) + '</label>' +
+      '<input type="text" id="customApiOrderId" placeholder="' + escapeAttr(t('customApi.orderIdPlaceholder')) + '" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="addCustomApiBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('addCustomApiBtn').addEventListener('click', addCustomApiAccount);
+  }
+  async function addCustomApiAccount() {
+    const baseUrl = $('customApiBaseUrl').value.trim();
+    const apiKey = $('customApiKey').value.trim();
+    const orderId = $('customApiOrderId').value.trim();
+    if (!baseUrl || !apiKey || !orderId) return toastWarning(t('customApi.missingFields'));
+    // POST straight to /admin/add_custom_api_account (admin-key auth via
+    // X-Admin-Password). The panel's api() helper is not used here because it
+    // hard-prefixes /admin/api, and this route lives under /admin directly.
+    try {
+      const res = await fetch('/admin/add_custom_api_account', {
+        method: 'POST',
+        headers: { 'X-Admin-Password': password, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baseUrl, apiKey, orderId })
+      });
+      const d = await res.json();
+      if (res.ok && d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('customApi.success'));
         autoRefreshNewAccount(d.id);
       } else {
         toastError(t('common.failed') + ': ' + (d.error || ''));

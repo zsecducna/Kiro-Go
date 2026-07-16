@@ -196,6 +196,48 @@ func TestCustomApiChargesCredits(t *testing.T) {
 	}
 }
 
+// Model list comes from the upstream provider's /v1/models, not Kiro.
+func TestProbeCustomApiModels(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("path %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer sk-up" {
+			t.Fatalf("auth %q", r.Header.Get("Authorization"))
+		}
+		w.Write([]byte(`{"object":"list","data":[{"id":"claude-opus-4.8"},{"id":"gpt-4o"},{"id":""}]}`))
+	}))
+	defer upstream.Close()
+
+	models, err := probeCustomApiModels(upstream.URL, "sk-up")
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if len(models) != 2 || models[0].ModelId != "claude-opus-4.8" || models[1].ModelId != "gpt-4o" {
+		t.Fatalf("unexpected models: %+v", models)
+	}
+}
+
+// The admin test button sends a real chat request through the upstream and returns
+// the assistant reply text.
+func TestCustomApiTestReply(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("path %s", r.URL.Path)
+		}
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok!"}}]}`))
+	}))
+	defer upstream.Close()
+
+	reply, err := customApiTestReply(upstream.URL, "sk-up", "claude-opus-4.8")
+	if err != nil {
+		t.Fatalf("test reply: %v", err)
+	}
+	if reply != "ok!" {
+		t.Fatalf("reply %q", reply)
+	}
+}
+
 // A request that already carries the forwarded marker is refused (loop guard).
 func TestForwardLoopGuard(t *testing.T) {
 	h := newCustomApiTestHandler(t, config.Account{})

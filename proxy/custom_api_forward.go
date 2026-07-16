@@ -95,6 +95,87 @@ var probeCustomApiQuota = func(baseURL, apiKey string) (*customApiQuota, error) 
 	}, nil
 }
 
+// probeCustomApiModels fetches the model list from the upstream pool's OpenAI-style
+// GET {baseURL}/v1/models (data:[{id}]) using the upstream key, and returns them as
+// ModelInfo. Custom API accounts serve whatever the linked pool serves, so the model
+// list must come from the upstream, not from Kiro/AWS. Package var so tests can stub.
+var probeCustomApiModels = func(baseURL, apiKey string) ([]ModelInfo, error) {
+	url := strings.TrimRight(baseURL, "/") + "/v1/models"
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("x-api-key", apiKey)
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{}}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("upstream /v1/models returned %d", resp.StatusCode)
+	}
+	var raw struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("upstream /v1/models: bad JSON: %w", err)
+	}
+	models := make([]ModelInfo, 0, len(raw.Data))
+	for _, m := range raw.Data {
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			continue
+		}
+		models = append(models, ModelInfo{ModelId: id, ModelName: id})
+	}
+	return models, nil
+}
+
+// customApiTestReply sends a minimal chat request through the linked upstream pool
+// and returns the assistant reply text, so the admin "test account" button verifies
+// the whole path (auth + routing) end-to-end. model defaults when empty.
+func customApiTestReply(baseURL, apiKey, model string) (string, error) {
+	if strings.TrimSpace(model) == "" {
+		model = "claude-sonnet-4"
+	}
+	reqBody := map[string]interface{}{
+		"model":      model,
+		"messages":   []map[string]string{{"role": "user", "content": "say ok"}},
+		"max_tokens": 16,
+		"stream":     false,
+	}
+	body, _ := json.Marshal(reqBody)
+	url := strings.TrimRight(baseURL, "/") + "/v1/chat/completions"
+	resp, err := forwardUpstreamRequest(http.MethodPost, url, apiKey, body, false)
+	if err != nil {
+		return "", fmt.Errorf("custom_api test connect: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("custom_api upstream HTTP %d", resp.StatusCode)
+	}
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", fmt.Errorf("custom_api test: bad JSON: %w", err)
+	}
+	if len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("custom_api test: empty response")
+	}
+	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+}
+
 // customApiQuotaAcceptable is the add-time gate: accept when the upstream key is
 // valid and either has remaining quota, or is unlimited (both limits zero).
 func customApiQuotaAcceptable(q *customApiQuota) bool {

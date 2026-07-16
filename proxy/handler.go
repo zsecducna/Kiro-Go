@@ -652,10 +652,21 @@ func (h *Handler) refreshModelsCache() {
 	aggregated := make([]ModelInfo, 0)
 	for i := range accounts {
 		account := &accounts[i]
-		// Custom API accounts serve all models (empty model list = optimistic routing);
-		// probing their upstream key against AWS ListAvailableModels would 403 and
-		// auto-ban them. Skip — leaving their model list empty is the desired behavior.
+		// Custom API accounts load their model list from the linked upstream pool's
+		// /v1/models (not Kiro/AWS): fetch, cache for routing, and aggregate into the
+		// global model list. On failure, skip without banning.
 		if account.IsCustomApi() {
+			models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
+			if err != nil {
+				logger.Warnf("[ModelsCache] custom_api %s model fetch failed: %v", account.ID, err)
+				continue
+			}
+			modelIDs := make([]string, 0, len(models))
+			for _, m := range models {
+				modelIDs = append(modelIDs, m.ModelId)
+			}
+			h.pool.SetModelList(account.ID, modelIDs)
+			aggregated = mergeUniqueModels(aggregated, models)
 			continue
 		}
 		if err := h.ensureValidToken(account); err != nil {
@@ -691,9 +702,18 @@ func (h *Handler) refreshModelsCache() {
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
 // 同时更新 pool 的路由缓存与全局聚合模型列表。
 func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
-	// Custom API accounts have no Kiro model list to fetch (they serve all models via
-	// optimistic routing); probing their upstream key against AWS would 403 + auto-ban.
+	// Custom API accounts load their model list from the linked upstream pool's
+	// /v1/models (not Kiro/AWS), then cache it for routing.
 	if account.IsCustomApi() {
+		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
+		if err != nil {
+			return err
+		}
+		modelIDs := make([]string, 0, len(models))
+		for _, m := range models {
+			modelIDs = append(modelIDs, m.ModelId)
+		}
+		h.pool.SetModelList(account.ID, modelIDs)
 		return nil
 	}
 	if err := h.ensureValidToken(account); err != nil {
@@ -4074,21 +4094,20 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 
-	// Custom API accounts have no Kiro credential to exercise; a real Kiro call would
-	// always fail with their upstream key. Test them by probing the upstream pool's
-	// /api/me quota endpoint instead.
+	// Custom API accounts have no Kiro credential to exercise; test them by sending a
+	// real minimal chat request THROUGH the linked upstream pool and returning its reply.
 	if account.IsCustomApi() {
-		quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
-		if err != nil || !customApiQuotaAcceptable(quota) {
-			msg := "upstream quota check failed"
-			if err != nil {
-				msg = err.Error()
-			}
+		var tReq struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&tReq)
+		reply, err := customApiTestReply(account.BaseURL, account.KiroApiKey, tReq.Model)
+		if err != nil {
 			w.WriteHeader(502)
-			json.NewEncoder(w).Encode(map[string]string{"error": msg})
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "custom_api upstream reachable"})
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "reply": reply})
 		return
 	}
 
@@ -4157,6 +4176,22 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 	if account == nil {
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+
+	// Custom API accounts have no Kiro token/usage to refresh. "Refresh" for them means
+	// re-validating the upstream key against its /api/me quota and reloading the model
+	// list from the upstream /v1/models — never a Kiro/AWS call.
+	if account.IsCustomApi() {
+		if _, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey); err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if err := h.fetchAndCacheAccountModels(account); err != nil {
+			logger.Warnf("[Refresh] custom_api model reload failed for %s: %v", account.ID, err)
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "custom_api upstream reachable"})
 		return
 	}
 
@@ -4338,6 +4373,24 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 	if account == nil {
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+
+	// Custom API accounts serve whatever the linked pool serves: load the model list
+	// from the upstream provider's /v1/models, not from Kiro/AWS.
+	if account.IsCustomApi() {
+		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
+		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		modelIDs := make([]string, 0, len(models))
+		for _, m := range models {
+			modelIDs = append(modelIDs, m.ModelId)
+		}
+		h.pool.SetModelList(id, modelIDs)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models})
 		return
 	}
 

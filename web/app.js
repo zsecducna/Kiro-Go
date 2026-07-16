@@ -968,10 +968,10 @@
         '<div class="account-info-text">' +
         '<div class="account-email">' + escapeHtml(displayEmail) + '</div>' +
         '<div class="account-meta">' +
-        getSubBadge(a.subscriptionType) +
-        getTrialBadge(a) +
+        // Custom API accounts are pool proxies, not Kiro subscriptions: no
+        // subscription/trial/overage badges (they'd default to a misleading "Free").
+        (a.authMethod === 'custom_api' ? '' : (getSubBadge(a.subscriptionType) + getTrialBadge(a) + overageBadge)) +
         weightBadge +
-        overageBadge +
         '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
         getStatusBadge(a) +
         '</div>' +

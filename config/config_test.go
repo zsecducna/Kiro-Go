@@ -127,3 +127,32 @@ func TestAccountAllowOverageMigration(t *testing.T) {
 		}
 	}
 }
+
+// Custom API accounts persist their upstream base URL, order id, and tags
+// through JSON round-trip so /admin/pool and the panel can display them.
+func TestAccountCustomApiFieldsRoundTrip(t *testing.T) {
+	a := Account{
+		ID:         "acc1",
+		AuthMethod: "custom_api",
+		BaseURL:    "https://pool.example.com",
+		KiroApiKey: "sk-upstream",
+		OrderID:    "ORD-1234",
+		Nickname:   "ORD-1234",
+		Tags:       []string{"Custom API"},
+		Enabled:    true,
+	}
+	b, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got Account
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.BaseURL != a.BaseURL || got.OrderID != a.OrderID || got.AuthMethod != "custom_api" {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+	if len(got.Tags) != 1 || got.Tags[0] != "Custom API" {
+		t.Fatalf("tags round-trip mismatch: %+v", got.Tags)
+	}
+}

@@ -41,6 +41,14 @@ type Account struct {
 	UserId   string `json:"userId,omitempty"`   // Kiro user ID
 	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
 
+	// Custom API (pool-linking) fields. Present only when AuthMethod == "custom_api":
+	// the account is a transparent proxy to ANOTHER Kiro-Go pool rather than a direct
+	// Kiro credential. The upstream bearer token is stored in KiroApiKey (its existing
+	// "upstream bearer, never refreshed" role); these fields carry the rest.
+	BaseURL string   `json:"baseUrl,omitempty"` // Upstream pool root, e.g. https://pool.example.com (no trailing /v1)
+	OrderID string   `json:"orderId,omitempty"` // Order id; also used as the account name/nickname
+	Tags    []string `json:"tags,omitempty"`    // Labels; custom_api accounts carry ["Custom API"]
+
 	// Authentication credentials
 	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
 	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal

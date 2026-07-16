@@ -7,12 +7,30 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"kiro-go/config"
 	"kiro-go/logger"
 )
+
+// customApiCreditsPer1kTokens is the operator-configured credit price for traffic
+// served by a Custom API (pool-linking) account. The upstream pool's reply carries
+// no credit figure, so the customer's key is billed from token usage at this rate —
+// which represents the OPERATOR's own resale pricing, independent of what the
+// upstream pool charges them. Without this, credit-limited keys would never exhaust
+// on forwarded traffic (free usage). Override with CUSTOM_API_CREDITS_PER_1K_TOKENS;
+// default 1.0 credit per 1000 tokens.
+func customApiCreditsPer1kTokens() float64 {
+	if v := strings.TrimSpace(os.Getenv("CUSTOM_API_CREDITS_PER_1K_TOKENS")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			return f
+		}
+	}
+	return 1.0
+}
 
 // custom_api "pool linking" support. A custom_api account is a transparent proxy
 // to ANOTHER Kiro-Go pool: incoming Anthropic/OpenAI requests are forwarded to
@@ -273,7 +291,14 @@ func (h *Handler) streamUpstream(w http.ResponseWriter, flusher http.Flusher, re
 	// Kiro path does) and record a FAILURE — never a success — so pool health reflects
 	// reality. Tokens from a truncated stream are not metered.
 	if streamErr != nil {
-		fmt.Fprintf(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":%q}}\n\n", "custom_api upstream stream interrupted: "+streamErr.Error())
+		msg := "custom_api upstream stream interrupted: " + streamErr.Error()
+		if p.endpoint == "anthropic" {
+			// Anthropic SSE error event shape.
+			fmt.Fprintf(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":%q}}\n\n", msg)
+		} else {
+			// OpenAI (chat + responses) SSE error chunk shape.
+			fmt.Fprintf(w, "data: {\"error\":{\"type\":\"api_error\",\"message\":%q}}\n\n", msg)
+		}
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -326,7 +351,9 @@ func (h *Handler) recordCustomApiSuccess(p forwardParams, inputTokens, outputTok
 	if p.endpoint == "openai" || p.endpoint == "responses" {
 		endpoint = "openai"
 	}
-	credits := 0.0
+	// The upstream reply has no credit figure; bill the customer key from tokens at
+	// the operator's configured resale rate so credit-limited keys actually deplete.
+	credits := float64(inputTokens+outputTokens) / 1000.0 * customApiCreditsPer1kTokens()
 	h.recordSuccessForApiKey(p.apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(p.account.ID)
 	h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))

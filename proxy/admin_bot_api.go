@@ -189,8 +189,8 @@ func (h *Handler) handleAdminDeleteApiKey(w http.ResponseWriter, r *http.Request
 // and supply the amount to ADD to its limits. Credits and/or Tokens; at least
 // one must be > 0. Amounts are additive top-ups, never absolute limits.
 type adminRechargeApiKeyRequest struct {
-	ID      string  `json:"id,omitempty"`     // Key entry UUID
-	ApiKey  string  `json:"apiKey,omitempty"` // Full cleartext key value (sk-...)
+	ID      string  `json:"id,omitempty"`      // Key entry UUID
+	ApiKey  string  `json:"apiKey,omitempty"`  // Full cleartext key value (sk-...)
 	Credits float64 `json:"credits,omitempty"` // Credits to ADD to the key's credit limit
 	Tokens  int64   `json:"tokens,omitempty"`  // Optional tokens to ADD to the token limit
 }

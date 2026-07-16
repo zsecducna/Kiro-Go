@@ -168,6 +168,34 @@ func TestForwardNonStreamPassthrough(t *testing.T) {
 	}
 }
 
+// Custom API traffic bills the customer's key/pool in credits derived from tokens at
+// the configured rate (upstream reply has no credit figure). Without this, credit-
+// limited keys never exhaust.
+func TestCustomApiChargesCredits(t *testing.T) {
+	t.Setenv("CUSTOM_API_CREDITS_PER_1K_TOKENS", "2.0")
+	if got := customApiCreditsPer1kTokens(); got != 2.0 {
+		t.Fatalf("rate override: got %v", got)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"m1","usage":{"input_tokens":300,"output_tokens":700}}`))
+	}))
+	defer upstream.Close()
+
+	acc := config.Account{ID: "c1", AuthMethod: "custom_api", BaseURL: upstream.URL, KiroApiKey: "sk-up", Enabled: true}
+	h := newCustomApiTestHandler(t, acc)
+	rec := httptest.NewRecorder()
+	if err := h.forwardToUpstream(rec, nil, forwardParams{
+		account: &acc, body: []byte(`{}`), endpoint: "anthropic", streaming: false, model: "x",
+	}); err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	// 1000 tokens / 1000 * 2.0 = 2.0 credits.
+	if got := h.getCredits(); got < 1.99 || got > 2.01 {
+		t.Fatalf("expected ~2.0 credits charged, got %v", got)
+	}
+}
+
 // A request that already carries the forwarded marker is refused (loop guard).
 func TestForwardLoopGuard(t *testing.T) {
 	h := newCustomApiTestHandler(t, config.Account{})

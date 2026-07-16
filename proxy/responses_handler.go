@@ -141,9 +141,11 @@ func (h *Handler) handleResponsesNonStream(
 		if account == nil {
 			break
 		}
-		// Custom API accounts already forwarded once must not add another hop.
+		// Custom API accounts already forwarded once must not add another hop. Excluded
+		// + attempt-- so an ineligible account is skipped without burning a retry.
 		if forwarded && account.IsCustomApi() {
 			excluded[account.ID] = true
+			attempt--
 			continue
 		}
 		if err := h.ensureValidToken(account); err != nil {
@@ -353,9 +355,11 @@ func (h *Handler) handleResponsesStream(
 		// handler has already emitted response.created, so a transparent forward would
 		// double-emit the upstream's own lifecycle events. Skip them (no ban, no
 		// translation against their non-Kiro key) and fail over to a Kiro account.
-		// Non-streaming /v1/responses forwards these accounts normally.
+		// Non-streaming /v1/responses forwards these accounts normally. Excluded +
+		// attempt-- so skipping an ineligible account does not burn a retry attempt.
 		if account.IsCustomApi() {
 			excluded[account.ID] = true
+			attempt--
 			continue
 		}
 		if err := h.ensureValidToken(account); err != nil {

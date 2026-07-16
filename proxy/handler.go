@@ -985,12 +985,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		// request; any pre-reply failure falls over to the next account like a Kiro error.
 		if account.IsCustomApi() {
 			// Already forwarded once: don't add another hop, and don't penalize this
-			// healthy account (loop-guard is not a failure) — just skip it.
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
 			if forwarded {
 				excluded[account.ID] = true
+				attempt--
 				continue
 			}
-			if fwdErr := h.forwardToUpstream(w,flusher, forwardParams{
+			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
 				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
 			}); fwdErr != nil {
@@ -1576,12 +1579,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
 		if account.IsCustomApi() {
 			// Already forwarded once: don't add another hop, and don't penalize this
-			// healthy account (loop-guard is not a failure) — just skip it.
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
 			if forwarded {
 				excluded[account.ID] = true
+				attempt--
 				continue
 			}
-			if fwdErr := h.forwardToUpstream(w,nil, forwardParams{
+			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
 				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
 			}); fwdErr != nil {
@@ -1793,12 +1799,15 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
 		if account.IsCustomApi() {
 			// Already forwarded once: don't add another hop, and don't penalize this
-			// healthy account (loop-guard is not a failure) — just skip it.
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
 			if forwarded {
 				excluded[account.ID] = true
+				attempt--
 				continue
 			}
-			if fwdErr := h.forwardToUpstream(w,flusher, forwardParams{
+			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
 				account: account, body: rawBody, endpoint: "openai", streaming: true,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
 			}); fwdErr != nil {
@@ -2210,12 +2219,15 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
 		if account.IsCustomApi() {
 			// Already forwarded once: don't add another hop, and don't penalize this
-			// healthy account (loop-guard is not a failure) — just skip it.
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
 			if forwarded {
 				excluded[account.ID] = true
+				attempt--
 				continue
 			}
-			if fwdErr := h.forwardToUpstream(w,nil, forwardParams{
+			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
 				account: account, body: rawBody, endpoint: "openai", streaming: false,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
 			}); fwdErr != nil {
@@ -4059,6 +4071,24 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 	if account == nil {
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+
+	// Custom API accounts have no Kiro credential to exercise; a real Kiro call would
+	// always fail with their upstream key. Test them by probing the upstream pool's
+	// /api/me quota endpoint instead.
+	if account.IsCustomApi() {
+		quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
+		if err != nil || !customApiQuotaAcceptable(quota) {
+			msg := "upstream quota check failed"
+			if err != nil {
+				msg = err.Error()
+			}
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": msg})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "custom_api upstream reachable"})
 		return
 	}
 

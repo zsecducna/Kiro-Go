@@ -89,7 +89,7 @@ func TestOpenAIStreamEmitsFinishChunkOnMidStreamError(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleOpenAIStream(rec, payload, "claude-sonnet-4.5", false, 1, "")
+	h.handleOpenAIStream(rec, payload, "claude-sonnet-4.5", false, 1, "", nil, false)
 
 	body := rec.Body.String()
 	if !strings.Contains(body, `"finish_reason":"error"`) {

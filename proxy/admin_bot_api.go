@@ -1175,3 +1175,137 @@ var probeKiroAccount = func(account *config.Account) (*config.AccountInfo, error
 	}
 	return info, nil
 }
+
+// adminAddCustomApiRequest is the body for POST /admin/add_custom_api_account.
+// A Custom API account is a transparent proxy to ANOTHER Kiro-Go pool: BaseURL
+// is that pool's root and ApiKey is a key that pool issued to us.
+type adminAddCustomApiRequest struct {
+	BaseURL  string   `json:"baseUrl"`            // Upstream pool root (required)
+	ApiKey   string   `json:"apiKey"`             // Upstream bearer token (required)
+	OrderID  string   `json:"orderId"`            // Order id; required; doubles as the account name
+	Nickname string   `json:"nickname,omitempty"` // Optional display name; defaults to orderId
+	Tags     []string `json:"tags,omitempty"`     // Extra tags; "Custom API" is always added
+	Enabled  *bool    `json:"enabled,omitempty"`  // Route traffic immediately (default true)
+}
+
+// findCustomApiDuplicate returns an existing account that would collide with a new
+// Custom API add, or nil. A collision is the same OrderID, or the same
+// (BaseURL, ApiKey) pair — either means the operator is adding the same upstream twice.
+func findCustomApiDuplicate(orderID, baseURL, apiKey string) *config.Account {
+	orderID = strings.TrimSpace(orderID)
+	for _, a := range config.GetAccounts() {
+		if !strings.EqualFold(strings.TrimSpace(a.AuthMethod), "custom_api") {
+			continue
+		}
+		if orderID != "" && strings.EqualFold(strings.TrimSpace(a.OrderID), orderID) {
+			cp := a
+			return &cp
+		}
+		if a.BaseURL == baseURL && a.KiroApiKey == apiKey {
+			cp := a
+			return &cp
+		}
+	}
+	return nil
+}
+
+// addCustomApiAccount validates and persists a Custom API (pool-linking) account.
+// It is transport-agnostic so both the HTTP handler and the Telegram bot command
+// share one validation path. Returns the new account id, an HTTP-style status code,
+// and an error describing any rejection. Order of checks: required fields → base URL
+// normalization → dedup (cheap, before the network) → upstream quota probe.
+func (h *Handler) addCustomApiAccount(req adminAddCustomApiRequest) (string, int, error) {
+	apiKey := strings.TrimSpace(req.ApiKey)
+	orderID := strings.TrimSpace(req.OrderID)
+	if apiKey == "" {
+		return "", http.StatusBadRequest, fmt.Errorf("apiKey is required")
+	}
+	if orderID == "" {
+		return "", http.StatusBadRequest, fmt.Errorf("orderId is required")
+	}
+	baseURL, err := normalizeBaseURL(req.BaseURL)
+	if err != nil {
+		return "", http.StatusBadRequest, err
+	}
+
+	// Dedup BEFORE the network probe so a repeat add is cheap and can't be rejected
+	// for a transient upstream blip.
+	if dup := findCustomApiDuplicate(orderID, baseURL, apiKey); dup != nil {
+		return dup.ID, http.StatusConflict, fmt.Errorf("duplicate custom API account")
+	}
+
+	// Quota gate: prove the upstream key is live and has capacity.
+	quota, err := probeCustomApiQuota(baseURL, apiKey)
+	if err != nil || !customApiQuotaAcceptable(quota) {
+		if err != nil {
+			return "", http.StatusPaymentRequired, err
+		}
+		return "", http.StatusPaymentRequired, fmt.Errorf("upstream quota check failed")
+	}
+
+	nickname := strings.TrimSpace(req.Nickname)
+	if nickname == "" {
+		nickname = orderID
+	}
+	// Final tag set: "Custom API" plus any extras, de-duplicated.
+	tags := []string{"Custom API"}
+	for _, t := range req.Tags {
+		if t = strings.TrimSpace(t); t != "" && !strings.EqualFold(t, "Custom API") {
+			tags = append(tags, t)
+		}
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	account := config.Account{
+		ID:          auth.GenerateAccountID(),
+		Nickname:    nickname,
+		AuthMethod:  "custom_api",
+		BaseURL:     baseURL,
+		KiroApiKey:  apiKey, // upstream bearer
+		AccessToken: apiKey, // mirror for pool compatibility (see apiAddAccount)
+		OrderID:     orderID,
+		Tags:        tags,
+		Enabled:     enabled,
+		ExpiresAt:   0, // never refreshed
+		MachineId:   config.GenerateMachineId(),
+	}
+	if err := config.AddAccount(account); err != nil {
+		return "", http.StatusInternalServerError, err
+	}
+	h.pool.Reload()
+	return account.ID, http.StatusOK, nil
+}
+
+// handleAdminAddCustomApiAccount POST /admin/add_custom_api_account — add a
+// pool-linking account that forwards traffic to another Kiro-Go pool. Validates
+// (order id → dedup → upstream quota) before persisting. Mirrors the shape of
+// handleAdminAddKiroApiKey so the bot and panel read the same way.
+func (h *Handler) handleAdminAddCustomApiAccount(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	var req adminAddCustomApiRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	id, status, err := h.addCustomApiAccount(req)
+	if err != nil {
+		w.WriteHeader(status)
+		resp := map[string]interface{}{"error": err.Error()}
+		if status == http.StatusConflict && id != "" {
+			resp["id"] = id
+		}
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"id":      id,
+	})
+}

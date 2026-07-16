@@ -457,6 +457,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleAdminAddKiroAccount(w, r)
+	case path == "/admin/add_custom_api_account" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminAddCustomApiAccount(w, r)
 
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
@@ -894,15 +899,18 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	// forwarded marks a request that already passed through one Kiro-Go pool, so a
+	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
+	forwarded := r.Header.Get(forwardHeader) != ""
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body, forwarded)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body, forwarded)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -954,6 +962,21 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
+		}
+		// Custom API accounts are transparent proxies to another Kiro-Go pool: forward
+		// the raw request instead of translating to Kiro. A successful forward ends the
+		// request; any pre-reply failure falls over to the next account like a Kiro error.
+		if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
+			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 		messageStartUsage = cacheUsage
@@ -1511,7 +1534,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1526,6 +1549,19 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
+		}
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
+			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
@@ -1683,15 +1719,18 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	// forwarded marks a request that already passed through one Kiro-Go pool, so a
+	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
+	forwarded := r.Header.Get(forwardHeader) != ""
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, body, forwarded)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, body, forwarded)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1720,6 +1759,20 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
+		}
+
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
+			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
 		}
 
 		var toolCalls []ToolCall
@@ -2102,7 +2155,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2117,6 +2170,20 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
+		}
+
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
+			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
 		}
 
 		var content string
@@ -2199,6 +2266,11 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
+	// Custom API accounts carry a static upstream bearer (KiroApiKey); there is no
+	// OAuth token to refresh and no expiry to honor.
+	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
+		return nil
+	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}

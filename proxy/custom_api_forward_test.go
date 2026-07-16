@@ -79,6 +79,47 @@ func TestNormalizeBaseURL(t *testing.T) {
 	if _, err := normalizeBaseURL("pool.example.com"); err == nil {
 		t.Fatalf("expected error for scheme-less url")
 	}
+	if _, err := normalizeBaseURL("http://"); err == nil {
+		t.Fatalf("expected error for empty host")
+	}
+	if _, err := normalizeBaseURL("https://x.com/?a=1"); err == nil {
+		t.Fatalf("expected error for query string")
+	}
+	if got, err := normalizeBaseURL("https://x.com/gw/"); err != nil || got != "https://x.com/gw" {
+		t.Fatalf("path preserved: got %q err %v", got, err)
+	}
+}
+
+// A request already marked as forwarded must NOT be re-forwarded to a custom_api
+// account, and the healthy account must not be disabled (loop-guard is not a failure).
+func TestForwardedRequestSkipsCustomApiWithoutBan(t *testing.T) {
+	// forwardUpstreamRequest must never be called on this path.
+	orig := forwardUpstreamRequest
+	called := false
+	forwardUpstreamRequest = func(method, url, apiKey string, body []byte, stream bool) (*http.Response, error) {
+		called = true
+		return nil, nil
+	}
+	defer func() { forwardUpstreamRequest = orig }()
+
+	acc := config.Account{
+		ID: "c1", AuthMethod: "custom_api", BaseURL: "https://x", KiroApiKey: "sk-up",
+		AccessToken: "sk-up", OrderID: "ORD-1", Enabled: true,
+	}
+	h := newCustomApiTestHandler(t, acc)
+
+	reqBody := `{"model":"claude-sonnet-4","stream":false,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(reqBody)))
+	req.Header.Set(forwardHeader, "1")
+	rec := httptest.NewRecorder()
+	h.handleClaudeMessages(rec, req)
+
+	if called {
+		t.Fatalf("forwardUpstreamRequest must not run for an already-forwarded request")
+	}
+	if got, _ := config.GetAccountByID("c1"); got.Enabled != true || got.BanStatus != "" {
+		t.Fatalf("healthy custom_api account must not be banned; enabled=%v ban=%q", got.Enabled, got.BanStatus)
+	}
 }
 
 // custom_api accounts must never enter token refresh — ensureValidToken is a no-op.

@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"kiro-go/config"
+	"kiro-go/logger"
 )
 
 // custom_api "pool linking" support. A custom_api account is a transparent proxy
@@ -87,14 +89,26 @@ func customApiQuotaAcceptable(q *customApiQuota) bool {
 	return q.CreditsRemaining > 0 || q.TokensRemaining > 0
 }
 
-// normalizeBaseURL trims a trailing slash and requires an http(s) scheme so a
-// stored base URL is always safe to concatenate with /v1/... paths.
+// normalizeBaseURL validates and canonicalizes an upstream base URL so it is always
+// safe to concatenate with /v1/... paths. Requires an http(s) scheme and a non-empty
+// host, and rejects query/fragment (a base URL must not carry them). Returns
+// scheme://host + trimmed path.
 func normalizeBaseURL(raw string) (string, error) {
 	s := strings.TrimSpace(raw)
-	if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") {
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("baseUrl is not a valid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", fmt.Errorf("baseUrl must start with http:// or https://")
 	}
-	return strings.TrimRight(s, "/"), nil
+	if u.Host == "" {
+		return "", fmt.Errorf("baseUrl must include a host")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("baseUrl must not contain a query or fragment")
+	}
+	return u.Scheme + "://" + u.Host + strings.TrimRight(u.Path, "/"), nil
 }
 
 // forwardParams bundles everything forwardToUpstream needs from a dispatch handler.
@@ -110,10 +124,14 @@ type forwardParams struct {
 
 // upstreamPath maps the incoming API surface to the upstream pool's path.
 func upstreamPath(endpoint string) string {
-	if endpoint == "openai" {
+	switch endpoint {
+	case "openai":
 		return "/v1/chat/completions"
+	case "responses":
+		return "/v1/responses"
+	default:
+		return "/v1/messages"
 	}
-	return "/v1/messages"
 }
 
 // forwardUpstreamRequest performs the actual round-trip to the upstream pool. It
@@ -130,11 +148,15 @@ var forwardUpstreamRequest = func(method, url, apiKey string, body []byte, strea
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
-	// No client timeout: streaming replies are long-lived. Failover on connect
-	// errors is handled by the caller. Direct transport (Proxy nil): pool-to-pool
-	// forwarding goes straight out and avoids coupling to the process-global
-	// ProxyFromEnvironment cache that http.DefaultTransport shares.
+	// Direct transport (Proxy nil): pool-to-pool forwarding goes straight out and
+	// avoids coupling to the process-global ProxyFromEnvironment cache that
+	// http.DefaultTransport shares. Streaming replies are long-lived so they get no
+	// overall timeout; non-stream replies get a ceiling so a hung upstream can't pin
+	// the request forever.
 	client := &http.Client{Transport: &http.Transport{}}
+	if !stream {
+		client.Timeout = 120 * time.Second
+	}
 	return client.Do(req)
 }
 
@@ -176,18 +198,23 @@ func (h *Handler) forwardToUpstream(w http.ResponseWriter, flusher http.Flusher,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Drain a little for the error message; do NOT write to the client so the
-		// caller can fail over to another account.
+		// Log the upstream body for the operator, but return a status-only error: this
+		// error can bubble to the end customer on failover exhaustion, and the linked
+		// pool's raw error body must not leak downstream. The status code is preserved
+		// so the ban classifier still sees 401/403 correctly. No client write here, so
+		// the caller can fail over to another account.
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("custom_api upstream HTTP %d: %s", resp.StatusCode, string(msg))
+		logger.Warnf("[CustomApi] upstream %s HTTP %d: %s", p.account.ID, resp.StatusCode, strings.TrimSpace(string(msg)))
+		return fmt.Errorf("custom_api upstream HTTP %d", resp.StatusCode)
 	}
 
 	if p.streaming {
 		return h.streamUpstream(w, flusher, resp, p, reqStart)
 	}
 
-	// Non-streaming: copy the JSON reply verbatim, then meter.
-	body, err := io.ReadAll(resp.Body)
+	// Non-streaming: copy the JSON reply verbatim, then meter. Cap the read so a
+	// misbehaving upstream cannot balloon memory (32 MiB is far above any real reply).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		return fmt.Errorf("custom_api upstream read: %w", err)
 	}
@@ -214,6 +241,7 @@ func (h *Handler) streamUpstream(w http.ResponseWriter, flusher http.Flusher, re
 	var tail bytes.Buffer
 	const tailCap = 64 * 1024
 	buf := make([]byte, 16*1024)
+	var streamErr error
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
@@ -232,9 +260,32 @@ func (h *Handler) streamUpstream(w http.ResponseWriter, flusher http.Flusher, re
 			}
 		}
 		if readErr != nil {
-			break // io.EOF or upstream drop; stream already delivered what it had
+			// io.EOF is a clean end; any other error is a mid-stream upstream drop.
+			if readErr != io.EOF {
+				streamErr = readErr
+			}
+			break
 		}
 	}
+
+	// Mid-stream failure: the client already has committed headers and a partial
+	// stream, so we cannot fail over. Emit a best-effort terminal error event (as the
+	// Kiro path does) and record a FAILURE — never a success — so pool health reflects
+	// reality. Tokens from a truncated stream are not metered.
+	if streamErr != nil {
+		fmt.Fprintf(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":%q}}\n\n", "custom_api upstream stream interrupted: "+streamErr.Error())
+		if flusher != nil {
+			flusher.Flush()
+		}
+		endpoint := "claude"
+		if p.endpoint == "openai" || p.endpoint == "responses" {
+			endpoint = "openai"
+		}
+		h.pool.RecordError(p.account.ID, false)
+		h.recordFailureWithDetails(endpoint, p.model, p.account.ID, p.apiKeyID, streamErr)
+		return nil
+	}
+
 	in, out := parseStreamUsage(p.endpoint, tail.Bytes())
 	h.recordCustomApiSuccess(p, in, out, reqStart)
 	return nil
@@ -272,7 +323,7 @@ func parseStreamUsage(endpoint string, tail []byte) (int, int) {
 // left at 0 (the upstream pool bills us separately); token counts drive local stats.
 func (h *Handler) recordCustomApiSuccess(p forwardParams, inputTokens, outputTokens int, reqStart time.Time) {
 	endpoint := "claude"
-	if p.endpoint == "openai" {
+	if p.endpoint == "openai" || p.endpoint == "responses" {
 		endpoint = "openai"
 	}
 	credits := 0.0

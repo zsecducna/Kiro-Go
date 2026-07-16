@@ -688,7 +688,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		// api_key account: it must never write config (classifyAndBanOnUsageError
 		// would call UpdateAccount with the throwaway's empty ID). Guard BEFORE the
 		// classify/ban helper so both the suspension and auth-fail branches are skipped.
-		if account.IsApiKeyCredential() {
+		if account.IsApiKeyCredential() || account.IsCustomApi() {
 			return nil, fmt.Errorf("GetUsageLimits: %w", err)
 		}
 		return nil, classifyAndBanOnUsageError(account, err)

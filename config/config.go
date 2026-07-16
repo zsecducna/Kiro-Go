@@ -135,6 +135,16 @@ func (a *Account) IsApiKeyCredential() bool {
 	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "api_key")
 }
 
+// IsCustomApi reports whether the account is a "Custom API" pool-linking account:
+// a transparent proxy to ANOTHER Kiro-Go pool (BaseURL + a key it issued us), not a
+// direct Kiro credential. Such accounts must be excluded from every Kiro/AWS-facing
+// path (token refresh, usage-limit probes, model-list probes, ban classifiers) —
+// their AccessToken mirrors a non-Kiro upstream key, so a Kiro API call would fail
+// and the failure would wrongly auto-ban a healthy account.
+func (a *Account) IsCustomApi() bool {
+	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "custom_api")
+}
+
 // PromptFilterRule defines a single custom prompt sanitization rule.
 // Type can be: "regex" (regexp find/replace within prompt) or
 // "lines-containing" (remove lines containing the match substring).

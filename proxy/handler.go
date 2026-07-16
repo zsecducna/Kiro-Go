@@ -289,6 +289,12 @@ func (h *Handler) refreshAllAccounts() {
 		if !account.Enabled || account.AccessToken == "" {
 			continue
 		}
+		// Custom API accounts are transparent proxies to another Kiro-Go pool: they
+		// have no Kiro token to refresh and no Kiro usage to fetch. Probing them
+		// against AWS with their mirrored upstream key would 403 and auto-ban them.
+		if account.IsCustomApi() {
+			continue
+		}
 
 		// 检查 token 是否需要刷新
 		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
@@ -646,6 +652,12 @@ func (h *Handler) refreshModelsCache() {
 	aggregated := make([]ModelInfo, 0)
 	for i := range accounts {
 		account := &accounts[i]
+		// Custom API accounts serve all models (empty model list = optimistic routing);
+		// probing their upstream key against AWS ListAvailableModels would 403 and
+		// auto-ban them. Skip — leaving their model list empty is the desired behavior.
+		if account.IsCustomApi() {
+			continue
+		}
 		if err := h.ensureValidToken(account); err != nil {
 			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
 			h.handleAccountFailure(account, err)
@@ -679,6 +691,11 @@ func (h *Handler) refreshModelsCache() {
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
 // 同时更新 pool 的路由缓存与全局聚合模型列表。
 func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
+	// Custom API accounts have no Kiro model list to fetch (they serve all models via
+	// optimistic routing); probing their upstream key against AWS would 403 + auto-ban.
+	if account.IsCustomApi() {
+		return nil
+	}
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
@@ -966,8 +983,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		// Custom API accounts are transparent proxies to another Kiro-Go pool: forward
 		// the raw request instead of translating to Kiro. A successful forward ends the
 		// request; any pre-reply failure falls over to the next account like a Kiro error.
-		if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
-			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it.
+			if forwarded {
+				excluded[account.ID] = true
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w,flusher, forwardParams{
 				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
 			}); fwdErr != nil {
@@ -1551,8 +1574,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			continue
 		}
 		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
-		if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
-			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it.
+			if forwarded {
+				excluded[account.ID] = true
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w,nil, forwardParams{
 				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
 			}); fwdErr != nil {
@@ -1762,8 +1791,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
-		if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
-			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it.
+			if forwarded {
+				excluded[account.ID] = true
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w,flusher, forwardParams{
 				account: account, body: rawBody, endpoint: "openai", streaming: true,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
 			}); fwdErr != nil {
@@ -2173,8 +2208,14 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
-		if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
-			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it.
+			if forwarded {
+				excluded[account.ID] = true
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w,nil, forwardParams{
 				account: account, body: rawBody, endpoint: "openai", streaming: false,
 				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
 			}); fwdErr != nil {

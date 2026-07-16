@@ -510,9 +510,9 @@
   "modal.customApiDesc": "对接另一个 Kiro-Go 池：使用对方签发给你的密钥，将流量转发到其 Base URL。",
   "customApi.baseUrl": "Base URL",
   "customApi.apiKey": "API 密钥",
-  "customApi.orderId": "订单号",
+  "customApi.orderId": "密钥名称",
   "customApi.tags": "标签",
-  "customApi.orderIdPlaceholder": "例如 ORD-1234（同时作为名称）",
+  "customApi.orderIdPlaceholder": "例如 ORD-1234 或该密钥的名称",
   "customApi.missingFields": "Base URL、API 密钥、订单号均为必填",
   "customApi.success": "已添加自定义 API 账号"
 }

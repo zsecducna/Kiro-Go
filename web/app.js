@@ -2351,7 +2351,7 @@
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.customApiDesc')) + '</p>' +
       '<div class="form-group"><label>' + escapeHtml(t('customApi.baseUrl')) + '</label>' +
-      '<input type="text" id="customApiBaseUrl" class="font-mono" placeholder="https://pool.example.com" /></div>' +
+      '<input type="text" id="customApiBaseUrl" class="font-mono" value="https://codezdev-shop.uk:8080/" placeholder="https://pool.example.com" /></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('customApi.apiKey')) + '</label>' +
       '<input type="text" id="customApiKey" class="font-mono" placeholder="sk-..." /></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('customApi.orderId')) + '</label>' +

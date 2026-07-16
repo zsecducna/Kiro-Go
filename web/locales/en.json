@@ -510,9 +510,9 @@
   "modal.customApiDesc": "Link another Kiro-Go pool: forward traffic to its base URL using a key it issued you.",
   "customApi.baseUrl": "Base URL",
   "customApi.apiKey": "API Key",
-  "customApi.orderId": "Order ID",
+  "customApi.orderId": "Key name",
   "customApi.tags": "Tags",
-  "customApi.orderIdPlaceholder": "e.g. ORD-1234 (also used as the name)",
+  "customApi.orderIdPlaceholder": "e.g. ORD-1234 or a label for this key",
   "customApi.missingFields": "Base URL, API Key, and Order ID are all required",
   "customApi.success": "Custom API account added"
 }

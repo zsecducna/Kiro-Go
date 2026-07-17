@@ -64,7 +64,7 @@ func TestAddCustomApiAccountSuccess(t *testing.T) {
 	}
 }
 
-func TestAddCustomApiRejectBadQuota(t *testing.T) {
+func TestAddCustomApiAddsDespiteBadQuota(t *testing.T) {
 	orig := probeCustomApiQuota
 	probeCustomApiQuota = func(baseURL, apiKey string) (*customApiQuota, error) {
 		return &customApiQuota{OK: false}, http.ErrHandlerTimeout
@@ -75,8 +75,18 @@ func TestAddCustomApiRejectBadQuota(t *testing.T) {
 	rec := postAddCustomApi(t, h, map[string]interface{}{
 		"baseUrl": "https://pool.example.com", "apiKey": "bad", "orderId": "ORD-2",
 	})
-	if rec.Code == http.StatusOK {
-		t.Fatalf("expected non-200 for bad quota, got 200")
+	// Quota check is best-effort: an unreachable/invalid upstream must NOT block the add.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (add despite failed quota), got %d: %s", rec.Code, rec.Body.String())
+	}
+	found := false
+	for _, a := range config.GetAccounts() {
+		if a.AuthMethod == "custom_api" && a.OrderID == "ORD-2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("account should be added even when quota check fails")
 	}
 }
 

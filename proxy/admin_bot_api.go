@@ -1234,13 +1234,13 @@ func (h *Handler) addCustomApiAccount(req adminAddCustomApiRequest) (string, int
 		return dup.ID, http.StatusConflict, fmt.Errorf("duplicate custom API account")
 	}
 
-	// Quota gate: prove the upstream key is live and has capacity.
-	quota, err := probeCustomApiQuota(baseURL, apiKey)
-	if err != nil || !customApiQuotaAcceptable(quota) {
-		if err != nil {
-			return "", http.StatusPaymentRequired, err
-		}
-		return "", http.StatusPaymentRequired, fmt.Errorf("upstream quota check failed")
+	// Quota check is best-effort, NOT a gate: a reachable upstream lets us persist the
+	// quota for immediate display, but an unreachable/zero-quota upstream must not block
+	// adding the account (the key may be provisioned later, or the endpoint temporarily
+	// down). quota is applied after AddAccount below when the probe succeeded.
+	quota, quotaErr := probeCustomApiQuota(baseURL, apiKey)
+	if quotaErr != nil {
+		logger.Warnf("[AddCustomApi] quota check failed for orderId=%s (%s), adding anyway: %v", orderID, baseURL, quotaErr)
 	}
 
 	nickname := strings.TrimSpace(req.Nickname)
@@ -1275,10 +1275,12 @@ func (h *Handler) addCustomApiAccount(req adminAddCustomApiRequest) (string, int
 	if err := config.AddAccount(account); err != nil {
 		return "", http.StatusInternalServerError, err
 	}
-	// Persist the upstream quota (already fetched above) so /admin/pool and the panel
-	// show it immediately, not only after the next background refresh.
-	if updateErr := config.UpdateAccountInfo(account.ID, quota.toAccountInfo(time.Now().Unix())); updateErr != nil {
-		logger.Warnf("[AddCustomApi] failed to persist quota for %s: %v", account.ID, updateErr)
+	// Persist the upstream quota only if the probe succeeded; otherwise the panel shows
+	// it after the next background refresh once the upstream is reachable.
+	if quotaErr == nil && quota != nil && quota.OK {
+		if updateErr := config.UpdateAccountInfo(account.ID, quota.toAccountInfo(time.Now().Unix())); updateErr != nil {
+			logger.Warnf("[AddCustomApi] failed to persist quota for %s: %v", account.ID, updateErr)
+		}
 	}
 	h.pool.Reload()
 	return account.ID, http.StatusOK, nil
@@ -1286,7 +1288,8 @@ func (h *Handler) addCustomApiAccount(req adminAddCustomApiRequest) (string, int
 
 // handleAdminAddCustomApiAccount POST /admin/add_custom_api_account — add a
 // pool-linking account that forwards traffic to another Kiro-Go pool. Validates
-// (order id → dedup → upstream quota) before persisting. Mirrors the shape of
+// order id and dedup before persisting; the upstream quota probe is best-effort
+// (populates quota when reachable, never blocks the add). Mirrors the shape of
 // handleAdminAddKiroApiKey so the bot and panel read the same way.
 func (h *Handler) handleAdminAddCustomApiAccount(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

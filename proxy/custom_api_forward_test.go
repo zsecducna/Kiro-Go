@@ -55,6 +55,55 @@ func TestProbeCustomApiQuotaAccept(t *testing.T) {
 	}
 }
 
+// When /api/me is unavailable, the quota probe falls back to POST /checkkey/info
+// with {"key": apiKey} and parses the same credit/token fields.
+func TestProbeCustomApiQuotaFallsBackToCheckKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			w.WriteHeader(http.StatusNotFound)
+		case "/checkkey/info":
+			if r.Method != http.MethodPost {
+				t.Fatalf("checkkey must be POST, got %s", r.Method)
+			}
+			var b struct {
+				Key string `json:"key"`
+			}
+			json.NewDecoder(r.Body).Decode(&b)
+			if b.Key != "sk-abc" {
+				t.Fatalf("checkkey body key=%q", b.Key)
+			}
+			w.Write([]byte(`{"found":true,"creditsUsed":0,"creditLimit":50000,"creditsRemaining":50000}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	q, err := probeCustomApiQuota(srv.URL, "sk-abc")
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if !q.OK || q.CreditLimit != 50000 {
+		t.Fatalf("checkkey quota not parsed: %+v", q)
+	}
+}
+
+// checkkey found:false → treated as an invalid key (probe error).
+func TestCheckKeyNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(`{"found":false}`))
+	}))
+	defer srv.Close()
+	if _, err := probeCustomApiQuota(srv.URL, "bad"); err == nil {
+		t.Fatalf("expected error when checkkey reports found:false")
+	}
+}
+
 // A key whose limits are set but remaining is zero is rejected.
 func TestCustomApiQuotaRejectZero(t *testing.T) {
 	q := &customApiQuota{CreditsRemaining: 0, TokensRemaining: 0, CreditLimit: 100, TokenLimit: 0, OK: true}

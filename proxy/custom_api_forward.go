@@ -71,10 +71,58 @@ func (q *customApiQuota) toAccountInfo(now int64) config.AccountInfo {
 	return info
 }
 
-// probeCustomApiQuota calls {baseURL}/api/me with the supplied bearer token and
-// returns the parsed quota. It is a package var so tests can stub the round-trip.
-// A 5s timeout keeps a dead upstream from hanging the add-account request.
+// quotaFields is the credit/token shape both upstream quota endpoints share
+// (/api/me on a Kiro-Go pool, /checkkey/info on other pool software). `found` is
+// only present on /checkkey/info; a false value means the key does not exist.
+type quotaFields struct {
+	Found            *bool   `json:"found"`
+	CreditsRemaining float64 `json:"creditsRemaining"`
+	CreditsUsed      float64 `json:"creditsUsed"`
+	TokensRemaining  int64   `json:"tokensRemaining"`
+	TokensUsed       int64   `json:"tokensUsed"`
+	CreditLimit      float64 `json:"creditLimit"`
+	TokenLimit       int64   `json:"tokenLimit"`
+}
+
+// toQuota converts the shared field shape into a customApiQuota.
+func (f quotaFields) toQuota() *customApiQuota {
+	return &customApiQuota{
+		CreditsRemaining: f.CreditsRemaining,
+		CreditsUsed:      f.CreditsUsed,
+		TokensRemaining:  f.TokensRemaining,
+		TokensUsed:       f.TokensUsed,
+		CreditLimit:      f.CreditLimit,
+		TokenLimit:       f.TokenLimit,
+		OK:               true,
+	}
+}
+
+// customApiHTTPClient is a direct-transport client (Proxy nil) so pool-to-pool
+// probes go straight out and never touch the process-global ProxyFromEnvironment
+// cache — keeping add-time probes independent of egress-proxy env state.
+func customApiHTTPClient() *http.Client {
+	return &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{}}
+}
+
+// probeCustomApiQuota fetches the upstream key's quota. It tries GET {baseURL}/api/me
+// (Kiro-Go pools) first; if that is unavailable it falls back to POST
+// {baseURL}/checkkey/info with {"key": apiKey} (other pool software). Package var so
+// tests can stub the round-trip.
 var probeCustomApiQuota = func(baseURL, apiKey string) (*customApiQuota, error) {
+	q, err := probeQuotaViaApiMe(baseURL, apiKey)
+	if err == nil {
+		return q, nil
+	}
+	// /api/me unavailable — try the /checkkey/info fallback.
+	q2, err2 := probeQuotaViaCheckKey(baseURL, apiKey)
+	if err2 == nil {
+		return q2, nil
+	}
+	return &customApiQuota{OK: false}, fmt.Errorf("quota check failed (api/me: %v; checkkey/info: %v)", err, err2)
+}
+
+// probeQuotaViaApiMe reads GET {baseURL}/api/me with the key as a bearer token.
+func probeQuotaViaApiMe(baseURL, apiKey string) (*customApiQuota, error) {
 	url := strings.TrimRight(baseURL, "/") + "/api/me"
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -82,39 +130,49 @@ var probeCustomApiQuota = func(baseURL, apiKey string) (*customApiQuota, error) 
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("x-api-key", apiKey)
-	// Direct transport (Proxy nil): pool-to-pool calls go straight out and, unlike the
-	// shared http.DefaultTransport, never touch the process-global ProxyFromEnvironment
-	// cache — keeping this add-time probe independent of egress-proxy env state.
-	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{}}
-	resp, err := client.Do(req)
+	resp, err := customApiHTTPClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return &customApiQuota{OK: false}, fmt.Errorf("upstream /api/me returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("/api/me returned %d", resp.StatusCode)
 	}
-	var raw struct {
-		CreditsRemaining float64 `json:"creditsRemaining"`
-		CreditsUsed      float64 `json:"creditsUsed"`
-		TokensRemaining  int64   `json:"tokensRemaining"`
-		TokensUsed       int64   `json:"tokensUsed"`
-		CreditLimit      float64 `json:"creditLimit"`
-		TokenLimit       int64   `json:"tokenLimit"`
-	}
+	var raw quotaFields
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return &customApiQuota{OK: false}, fmt.Errorf("upstream /api/me: bad JSON: %w", err)
+		return nil, fmt.Errorf("/api/me: bad JSON: %w", err)
 	}
-	return &customApiQuota{
-		CreditsRemaining: raw.CreditsRemaining,
-		CreditsUsed:      raw.CreditsUsed,
-		TokensRemaining:  raw.TokensRemaining,
-		TokensUsed:       raw.TokensUsed,
-		CreditLimit:      raw.CreditLimit,
-		TokenLimit:       raw.TokenLimit,
-		OK:               true,
-	}, nil
+	return raw.toQuota(), nil
+}
+
+// probeQuotaViaCheckKey reads POST {baseURL}/checkkey/info with {"key": apiKey}. A
+// "found": false response means the key does not exist on that upstream.
+func probeQuotaViaCheckKey(baseURL, apiKey string) (*customApiQuota, error) {
+	url := strings.TrimRight(baseURL, "/") + "/checkkey/info"
+	reqBody, _ := json.Marshal(map[string]string{"key": apiKey})
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := customApiHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("/checkkey/info returned %d", resp.StatusCode)
+	}
+	var raw quotaFields
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("/checkkey/info: bad JSON: %w", err)
+	}
+	if raw.Found != nil && !*raw.Found {
+		return nil, fmt.Errorf("/checkkey/info: key not found")
+	}
+	return raw.toQuota(), nil
 }
 
 // probeCustomApiModels fetches the model list from the upstream pool's OpenAI-style

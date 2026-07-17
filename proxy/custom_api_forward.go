@@ -540,89 +540,95 @@ func (h *Handler) recordCustomApiSuccess(p forwardParams, inputTokens, outputTok
 	h.recordSuccessLog(endpoint, p.model, p.account.ID, p.apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 }
 
-// customApiCreditLedger tracks, per custom_api account, the cumulative upstream
-// credits already billed to customers. On each request it is reconciled against the
-// upstream's authoritative creditsUsed so the sum billed converges exactly on what
-// the pool actually deducted. Guarded by its own mutex; safe for concurrent requests
-// sharing one upstream account.
+// customApiRateTTL bounds how long a cached upstream price is reused before the next
+// request re-probes. The pool's blended per-token rate moves slowly (it is a
+// cumulative average), so a couple of minutes keeps billing current without a probe
+// per request.
+const customApiRateTTL = 2 * time.Minute
+
+// customApiCreditLedger caches, per custom_api account, the upstream pool's blended
+// per-token price (its cumulative creditsUsed / tokensUsed from /checkkey/info). Each
+// request is billed reqTokens * that rate.
 //
-// Attribution caveat: the reconciliation is per-ACCOUNT, but the charge posts to the
-// requesting customer key. When multiple customer keys share one upstream account,
-// each request is billed the whole delta accrued since the previous reconciliation —
-// so concurrent requests from different keys can misattribute cost between them. The
-// aggregate billed per account is still exact; only the per-key split is approximate,
-// and only under shared-account concurrency (the common resale case is one customer
-// key per upstream account, where it is exact).
+// Why a cached pool rate rather than per-request deltas or a running token-share: many
+// customer keys share ONE upstream pool key and the pool reports only the key-wide
+// cumulative creditsUsed. Charging the delta-since-last-probe hands one request the
+// concurrent spend of every other customer (random huge/zero charges); a running
+// realTotal/sumTokens average does not telescope to real spend when per-request rates
+// vary (mixed models), so it drifts. The pool's own creditsUsed/tokensUsed ratio is a
+// stable, authoritative price: billing each request its own tokens at that rate is
+// smooth, fair across customers, needs no per-account accumulation, and has no
+// seed/reset/ordering races. Guarded by a mutex covering only the cache map.
 type customApiCreditLedger struct {
-	mu     sync.Mutex
-	billed map[string]float64 // accountID -> cumulative upstream creditsUsed already billed
-	seeded map[string]bool    // accountID -> baseline established
+	mu    sync.Mutex
+	rates map[string]customApiRate
+}
+
+type customApiRate struct {
+	perToken float64   // upstream credits per token
+	at       time.Time // when this rate was probed
 }
 
 func newCustomApiCreditLedger() *customApiCreditLedger {
-	return &customApiCreditLedger{
-		billed: make(map[string]float64),
-		seeded: make(map[string]bool),
-	}
+	return &customApiCreditLedger{rates: make(map[string]customApiRate)}
 }
 
-// billCustomApiRealCost returns the credits to charge this request. It probes the
-// upstream quota API for the account's current creditsUsed and bills the delta since
-// the last reconciliation. The ledger's stored value is the running total already
-// billed, so a successful probe both charges (now - billed) and snaps the total to
-// the pool's truth — self-correcting any earlier estimate drift (including downward:
-// a negative delta clamps to 0, refunding prior over-bills as free requests).
+// billCustomApiRealCost returns the credits to charge this request: its token count
+// times the upstream pool's blended per-token price. The price is cached per account
+// (customApiRateTTL); on a miss it probes the pool's quota API — after the client
+// already has the response, so no client latency.
 //
-// Fallback (probe failure, or first request with no baseline): the flat token-based
-// estimate. On probe failure the estimate is added to the running total so it is
-// reconciled away at the next successful probe; set CUSTOM_API_CREDITS_PER_1K_TOKENS
-// close to the pool's real rate so this rare path does not spike.
+// Fallbacks: a stale cached rate if the refresh probe fails; otherwise the flat token
+// estimate (CUSTOM_API_CREDITS_PER_1K_TOKENS) when no rate is known at all. Set that
+// env near the pool's real per-1k rate so a cold cache does not spike.
+//
+// Accuracy note: aggregate billed = ourTokens * poolRate, where poolRate is computed
+// from the pool's OWN token count. If our token counting under-reports relative to the
+// pool's, this under-bills proportionally (safe direction). Fixing that requires
+// aligning our token counts with the pool's, tracked separately.
 func (h *Handler) billCustomApiRealCost(p forwardParams, inputTokens, outputTokens int) float64 {
-	estimate := float64(inputTokens+outputTokens) / 1000.0 * customApiCreditsPer1kTokens()
+	tokens := float64(inputTokens + outputTokens)
+	estimate := tokens / 1000.0 * customApiCreditsPer1kTokens()
 
 	l := h.customApiLedger
 	if l == nil { // defensive: handlers built outside NewHandler (older tests)
 		return estimate
 	}
 
-	q, err := probeCustomApiQuota(p.account.BaseURL, p.account.KiroApiKey)
+	now := time.Now()
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// Probe failed: bill the flat estimate and leave the baseline UNTOUCHED. The
-	// request's real cost stays in the upstream's creditsUsed and is captured by the
-	// next successful probe's delta (safe direction — the operator never under-bills
-	// across a quota-endpoint outage). Never add estimate to billed: billed is in
-	// upstream-credit units, estimate is a resale-credit figure — mixing them would
-	// corrupt every subsequent delta.
-	if err != nil || q == nil || !q.OK {
-		logger.Warnf("[CustomApi] real-cost probe failed for %s, billing estimate %.4f: %v", p.account.ID, estimate, err)
-		return estimate
+	cached, ok := l.rates[p.account.ID]
+	fresh := ok && now.Sub(cached.at) < customApiRateTTL
+	if !fresh && ok {
+		// Claim this refresh window: bump the timestamp (keeping the old rate) before
+		// probing so concurrent requests reuse the cached rate instead of all probing
+		// at once, and so a FAILING probe backs off for a full TTL instead of every
+		// request re-probing throughout an outage. A successful probe below overwrites
+		// the rate. (Cold start with no cached entry still lets a one-time burst probe.)
+		l.rates[p.account.ID] = customApiRate{perToken: cached.perToken, at: now}
+	}
+	l.mu.Unlock()
+	if fresh {
+		return tokens * cached.perToken
 	}
 
-	prev, seeded := l.billed[p.account.ID], l.seeded[p.account.ID]
-
-	// (Re)seed on the first probe for this account, or when creditsUsed has dropped
-	// far below our baseline — an upstream recharge/reset. Seeding snaps the baseline
-	// to the current truth and bills this one request by estimate, since no trustworthy
-	// delta spans the gap. The 0.5 ratio separates a real reset (drops toward zero)
-	// from a tiny out-of-order probe race (a sub-credit dip), which the clamp handles.
-	if !seeded || (prev > 0 && q.CreditsUsed < prev*0.5) {
-		l.seeded[p.account.ID] = true
-		l.billed[p.account.ID] = q.CreditsUsed
-		return estimate
+	// Refresh the rate. Probe runs outside the lock — never hold the mutex across
+	// network I/O.
+	q, err := probeCustomApiQuota(p.account.BaseURL, p.account.KiroApiKey)
+	if err == nil && q != nil && q.OK && q.TokensUsed > 0 && q.CreditsUsed > 0 {
+		rate := q.CreditsUsed / float64(q.TokensUsed)
+		l.mu.Lock()
+		l.rates[p.account.ID] = customApiRate{perToken: rate, at: now}
+		l.mu.Unlock()
+		return tokens * rate
 	}
 
-	// Steady state: bill the real delta since the last reconciliation. The baseline
-	// only ever advances — never regresses — so a lower reading from a raced probe
-	// bills 0 rather than re-charging credits already billed. Aggregate billed
-	// converges on the pool's real spend.
-	spent := q.CreditsUsed - prev
-	if spent < 0 {
-		spent = 0
+	// Probe failed or reported no usable rate. Prefer a stale cached rate over the flat
+	// estimate — it is still the pool's real price, just not freshly confirmed.
+	if ok {
+		logger.Warnf("[CustomApi] rate refresh failed for %s, reusing cached rate %.6g: %v", p.account.ID, cached.perToken, err)
+		return tokens * cached.perToken
 	}
-	if q.CreditsUsed > prev {
-		l.billed[p.account.ID] = q.CreditsUsed
-	}
-	return spent
+	logger.Warnf("[CustomApi] no upstream rate for %s, billing estimate %.4f: %v", p.account.ID, estimate, err)
+	return estimate
 }

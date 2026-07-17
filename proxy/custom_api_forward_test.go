@@ -252,15 +252,15 @@ func TestCustomApiChargesCredits(t *testing.T) {
 	}
 }
 
-// Real-cost billing: the customer is charged the DELTA of the upstream pool's
-// reported creditsUsed, not a flat token price. The first request per account seeds
-// the baseline (billed by estimate); subsequent requests bill the real delta.
-func TestCustomApiBillsRealCostDelta(t *testing.T) {
-	t.Setenv("CUSTOM_API_CREDITS_PER_1K_TOKENS", "1.0")
+// Real-cost billing: each request is charged its own tokens times the pool's blended
+// per-token price (creditsUsed / tokensUsed), NOT a flat token price and NOT a
+// shared-account delta. Every request of the same size bills the same amount
+// regardless of what other customers on the shared pool key are spending.
+func TestCustomApiBillsPoolRate(t *testing.T) {
+	t.Setenv("CUSTOM_API_CREDITS_PER_1K_TOKENS", "1.0") // deliberately far from the real rate
 
-	// Upstream simulates a pool that has no /api/me, deducts 0.02 real credits per
-	// chat call, and reports the running creditsUsed via /checkkey/info.
-	var creditsUsed float64
+	// Pool reports a stable blended price: 3000 credits over 150M tokens = 2e-5 cr/token
+	// (0.02 cr/1K). Chat usage is 1000 tokens/request, so each request must bill ~0.02.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/me":
@@ -268,88 +268,64 @@ func TestCustomApiBillsRealCostDelta(t *testing.T) {
 		case "/checkkey/info":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"found": true, "creditsUsed": creditsUsed, "creditLimit": 1000.0,
+				"found": true, "creditsUsed": 3000.0, "tokensUsed": 150000000, "creditLimit": 100000.0,
 			})
-		default: // /v1/messages — the chat call deducts real credits upstream.
-			creditsUsed += 0.02
+		default:
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"id":"m1","usage":{"input_tokens":300,"output_tokens":700}}`))
 		}
 	}))
 	defer upstream.Close()
 
-	acc := config.Account{ID: "cd1", AuthMethod: "custom_api", BaseURL: upstream.URL, KiroApiKey: "sk-up", Enabled: true}
+	acc := config.Account{ID: "cpr1", AuthMethod: "custom_api", BaseURL: upstream.URL, KiroApiKey: "sk-up", Enabled: true}
 	h := newCustomApiTestHandler(t, acc)
-
-	forward := func() {
+	forward := func() float64 {
 		t.Helper()
+		before := h.getCredits()
 		if err := h.forwardToUpstream(httptest.NewRecorder(), nil, forwardParams{
 			account: &acc, body: []byte(`{}`), endpoint: "anthropic", streaming: false, model: "x",
 		}); err != nil {
 			t.Fatalf("forward: %v", err)
 		}
+		return h.getCredits() - before
 	}
 
-	// Request 1 seeds the baseline: billed by the flat estimate (1000 tok / 1000 * 1.0).
-	forward()
-	afterFirst := h.getCredits()
-	if afterFirst < 0.99 || afterFirst > 1.01 {
-		t.Fatalf("first request should bill estimate ~1.0, got %v", afterFirst)
-	}
-
-	// Request 2 bills the real upstream delta (0.02), NOT another ~1.0 flat charge.
-	forward()
-	delta := h.getCredits() - afterFirst
-	if delta < 0.019 || delta > 0.021 {
-		t.Fatalf("second request should bill real delta ~0.02, got %v", delta)
+	// 1000 tokens * (3000/150M) = 0.02. Every request the same, from the first — no seed
+	// ramp, no lump. Flat tokens/1000*1.0 would be 1.0 (50x too high).
+	for i := 0; i < 5; i++ {
+		if got := forward(); got < 0.0199 || got > 0.0201 {
+			t.Fatalf("request %d should bill ~0.02 (pool rate), got %v", i, got)
+		}
 	}
 }
 
-// An upstream recharge/reset drops creditsUsed far below our baseline. Billing must
-// re-seed (charge estimate for the crossing request) instead of billing 0 forever
-// until usage climbs back over the stale baseline.
-func TestCustomApiBillingReseedsAfterReset(t *testing.T) {
-	t.Setenv("CUSTOM_API_CREDITS_PER_1K_TOKENS", "1.0")
+// When the rate probe fails and nothing is cached yet, billing falls back to the flat
+// token estimate — never zero, never a spike.
+func TestCustomApiBillsFallbackWhenNoRate(t *testing.T) {
+	t.Setenv("CUSTOM_API_CREDITS_PER_1K_TOKENS", "0.03")
 
-	var creditsUsed float64 = 500 // account already has heavy prior usage
+	// Pool answers chats but its quota endpoint is down (both probe paths 500).
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/me":
-			w.WriteHeader(http.StatusNotFound)
-		case "/checkkey/info":
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"found": true, "creditsUsed": creditsUsed, "creditLimit": 100000.0,
-			})
+		case "/api/me", "/checkkey/info":
+			w.WriteHeader(http.StatusInternalServerError)
 		default:
-			creditsUsed += 0.02
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"id":"m1","usage":{"input_tokens":300,"output_tokens":700}}`))
 		}
 	}))
 	defer upstream.Close()
 
-	acc := config.Account{ID: "cr1", AuthMethod: "custom_api", BaseURL: upstream.URL, KiroApiKey: "sk-up", Enabled: true}
+	acc := config.Account{ID: "cfb1", AuthMethod: "custom_api", BaseURL: upstream.URL, KiroApiKey: "sk-up", Enabled: true}
 	h := newCustomApiTestHandler(t, acc)
-	forward := func() {
-		t.Helper()
-		if err := h.forwardToUpstream(httptest.NewRecorder(), nil, forwardParams{
-			account: &acc, body: []byte(`{}`), endpoint: "anthropic", streaming: false, model: "x",
-		}); err != nil {
-			t.Fatalf("forward: %v", err)
-		}
+	if err := h.forwardToUpstream(httptest.NewRecorder(), nil, forwardParams{
+		account: &acc, body: []byte(`{}`), endpoint: "anthropic", streaming: false, model: "x",
+	}); err != nil {
+		t.Fatalf("forward: %v", err)
 	}
-
-	forward() // seeds baseline at ~500
-	forward() // steady-state real delta ~0.02
-	base := h.getCredits()
-
-	// Upstream recharge: creditsUsed resets to ~0. Next request must re-seed and bill
-	// the estimate (~1.0), not 0.
-	creditsUsed = 0
-	forward()
-	if delta := h.getCredits() - base; delta < 0.99 || delta > 1.01 {
-		t.Fatalf("post-reset request should re-seed and bill estimate ~1.0, got %v", delta)
+	// 1000 tokens / 1000 * 0.03 = 0.03 estimate.
+	if got := h.getCredits(); got < 0.0299 || got > 0.0301 {
+		t.Fatalf("no-rate fallback should bill the estimate ~0.03, got %v", got)
 	}
 }
 

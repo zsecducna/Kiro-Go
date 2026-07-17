@@ -60,6 +60,10 @@ type Handler struct {
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
+	// custom_api (pool-linking) real-cost billing: tracks the last known upstream
+	// creditsUsed per account so each forwarded request is billed the real delta
+	// the upstream pool deducted, not a flat token-derived price.
+	customApiLedger *customApiCreditLedger
 }
 
 type thinkingStreamSource int
@@ -247,6 +251,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		customApiLedger: newCustomApiCreditLedger(),
 	}
 	cachePath := filepath.Join(config.GetConfigDir(), "prompt_cache.json")
 	h.promptCache.Load(cachePath)

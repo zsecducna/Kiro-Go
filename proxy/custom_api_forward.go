@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"kiro-go/config"
@@ -104,18 +105,34 @@ func customApiHTTPClient() *http.Client {
 	return &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{}}
 }
 
+// quotaEndpointPref caches which quota endpoint answered for a given baseURL. The
+// per-request real-cost probe calls probeCustomApiQuota on the hot path, so without
+// this a pool that only serves /checkkey/info would eat a wasted /api/me 404 on
+// every single request. baseURL -> "apime" | "checkkey".
+var quotaEndpointPref sync.Map
+
 // probeCustomApiQuota fetches the upstream key's quota. It tries GET {baseURL}/api/me
 // (Kiro-Go pools) first; if that is unavailable it falls back to POST
-// {baseURL}/checkkey/info with {"key": apiKey} (other pool software). Package var so
-// tests can stub the round-trip.
+// {baseURL}/checkkey/info with {"key": apiKey} (other pool software). The endpoint
+// that last worked for a baseURL is cached and tried first. Package var so tests can
+// stub the round-trip.
 var probeCustomApiQuota = func(baseURL, apiKey string) (*customApiQuota, error) {
+	// Fast path: reuse the endpoint that last answered for this pool.
+	if pref, ok := quotaEndpointPref.Load(baseURL); ok && pref == "checkkey" {
+		if q, err := probeQuotaViaCheckKey(baseURL, apiKey); err == nil {
+			return q, nil
+		}
+		// Cached endpoint stopped answering — fall through to the full probe.
+	}
 	q, err := probeQuotaViaApiMe(baseURL, apiKey)
 	if err == nil {
+		quotaEndpointPref.Store(baseURL, "apime")
 		return q, nil
 	}
 	// /api/me unavailable — try the /checkkey/info fallback.
 	q2, err2 := probeQuotaViaCheckKey(baseURL, apiKey)
 	if err2 == nil {
+		quotaEndpointPref.Store(baseURL, "checkkey")
 		return q2, nil
 	}
 	return &customApiQuota{OK: false}, fmt.Errorf("quota check failed (api/me: %v; checkkey/info: %v)", err, err2)
@@ -505,19 +522,107 @@ func parseStreamUsage(endpoint string, tail []byte) (int, int) {
 }
 
 // recordCustomApiSuccess mirrors the Kiro success path's metering so custom_api
-// traffic shows up in pool stats, per-key usage, and request logs. Credits are
-// left at 0 (the upstream pool bills us separately); token counts drive local stats.
+// traffic shows up in pool stats, per-key usage, and request logs. Runs AFTER the
+// client already has the full response, so the real-cost probe it does adds no
+// client-visible latency.
 func (h *Handler) recordCustomApiSuccess(p forwardParams, inputTokens, outputTokens int, reqStart time.Time) {
 	endpoint := "claude"
 	if p.endpoint == "openai" || p.endpoint == "responses" {
 		endpoint = "openai"
 	}
-	// The upstream reply has no credit figure; bill the customer key from tokens at
-	// the operator's configured resale rate so credit-limited keys actually deplete.
-	credits := float64(inputTokens+outputTokens) / 1000.0 * customApiCreditsPer1kTokens()
+	// Bill the REAL cost the upstream pool deducted for this request, read as the
+	// delta of its reported creditsUsed, instead of a flat token-derived price.
+	credits := h.billCustomApiRealCost(p, inputTokens, outputTokens)
 	h.recordSuccessForApiKey(p.apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(p.account.ID)
 	h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))
 	h.pool.UpdateStats(p.account.ID, inputTokens+outputTokens, credits)
 	h.recordSuccessLog(endpoint, p.model, p.account.ID, p.apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+}
+
+// customApiCreditLedger tracks, per custom_api account, the cumulative upstream
+// credits already billed to customers. On each request it is reconciled against the
+// upstream's authoritative creditsUsed so the sum billed converges exactly on what
+// the pool actually deducted. Guarded by its own mutex; safe for concurrent requests
+// sharing one upstream account.
+//
+// Attribution caveat: the reconciliation is per-ACCOUNT, but the charge posts to the
+// requesting customer key. When multiple customer keys share one upstream account,
+// each request is billed the whole delta accrued since the previous reconciliation —
+// so concurrent requests from different keys can misattribute cost between them. The
+// aggregate billed per account is still exact; only the per-key split is approximate,
+// and only under shared-account concurrency (the common resale case is one customer
+// key per upstream account, where it is exact).
+type customApiCreditLedger struct {
+	mu     sync.Mutex
+	billed map[string]float64 // accountID -> cumulative upstream creditsUsed already billed
+	seeded map[string]bool    // accountID -> baseline established
+}
+
+func newCustomApiCreditLedger() *customApiCreditLedger {
+	return &customApiCreditLedger{
+		billed: make(map[string]float64),
+		seeded: make(map[string]bool),
+	}
+}
+
+// billCustomApiRealCost returns the credits to charge this request. It probes the
+// upstream quota API for the account's current creditsUsed and bills the delta since
+// the last reconciliation. The ledger's stored value is the running total already
+// billed, so a successful probe both charges (now - billed) and snaps the total to
+// the pool's truth — self-correcting any earlier estimate drift (including downward:
+// a negative delta clamps to 0, refunding prior over-bills as free requests).
+//
+// Fallback (probe failure, or first request with no baseline): the flat token-based
+// estimate. On probe failure the estimate is added to the running total so it is
+// reconciled away at the next successful probe; set CUSTOM_API_CREDITS_PER_1K_TOKENS
+// close to the pool's real rate so this rare path does not spike.
+func (h *Handler) billCustomApiRealCost(p forwardParams, inputTokens, outputTokens int) float64 {
+	estimate := float64(inputTokens+outputTokens) / 1000.0 * customApiCreditsPer1kTokens()
+
+	l := h.customApiLedger
+	if l == nil { // defensive: handlers built outside NewHandler (older tests)
+		return estimate
+	}
+
+	q, err := probeCustomApiQuota(p.account.BaseURL, p.account.KiroApiKey)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Probe failed: bill the flat estimate and leave the baseline UNTOUCHED. The
+	// request's real cost stays in the upstream's creditsUsed and is captured by the
+	// next successful probe's delta (safe direction — the operator never under-bills
+	// across a quota-endpoint outage). Never add estimate to billed: billed is in
+	// upstream-credit units, estimate is a resale-credit figure — mixing them would
+	// corrupt every subsequent delta.
+	if err != nil || q == nil || !q.OK {
+		logger.Warnf("[CustomApi] real-cost probe failed for %s, billing estimate %.4f: %v", p.account.ID, estimate, err)
+		return estimate
+	}
+
+	prev, seeded := l.billed[p.account.ID], l.seeded[p.account.ID]
+
+	// (Re)seed on the first probe for this account, or when creditsUsed has dropped
+	// far below our baseline — an upstream recharge/reset. Seeding snaps the baseline
+	// to the current truth and bills this one request by estimate, since no trustworthy
+	// delta spans the gap. The 0.5 ratio separates a real reset (drops toward zero)
+	// from a tiny out-of-order probe race (a sub-credit dip), which the clamp handles.
+	if !seeded || (prev > 0 && q.CreditsUsed < prev*0.5) {
+		l.seeded[p.account.ID] = true
+		l.billed[p.account.ID] = q.CreditsUsed
+		return estimate
+	}
+
+	// Steady state: bill the real delta since the last reconciliation. The baseline
+	// only ever advances — never regresses — so a lower reading from a raced probe
+	// bills 0 rather than re-charging credits already billed. Aggregate billed
+	// converges on the pool's real spend.
+	spent := q.CreditsUsed - prev
+	if spent < 0 {
+		spent = 0
+	}
+	if q.CreditsUsed > prev {
+		l.billed[p.account.ID] = q.CreditsUsed
+	}
+	return spent
 }

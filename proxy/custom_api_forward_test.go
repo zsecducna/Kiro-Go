@@ -27,7 +27,7 @@ func newCustomApiTestHandler(t *testing.T, acc config.Account) *Handler {
 	}
 	p := accountpool.GetPool()
 	p.Reload()
-	return &Handler{pool: p}
+	return &Handler{pool: p, customApiLedger: newCustomApiCreditLedger()}
 }
 
 // A live upstream key with remaining credits passes the quota gate.
@@ -184,6 +184,13 @@ func TestEnsureValidTokenSkipsCustomApi(t *testing.T) {
 // JSON reply back verbatim.
 func TestForwardNonStreamPassthrough(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The post-response real-cost probe hits the quota endpoint; answer it so the
+		// test can focus on the chat passthrough assertions below.
+		if r.URL.Path == "/api/me" || r.URL.Path == "/checkkey/info" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"found":true,"creditsUsed":0,"creditLimit":1000}`))
+			return
+		}
 		if r.URL.Path != "/v1/messages" {
 			t.Fatalf("path %s", r.URL.Path)
 		}
@@ -242,6 +249,107 @@ func TestCustomApiChargesCredits(t *testing.T) {
 	// 1000 tokens / 1000 * 2.0 = 2.0 credits.
 	if got := h.getCredits(); got < 1.99 || got > 2.01 {
 		t.Fatalf("expected ~2.0 credits charged, got %v", got)
+	}
+}
+
+// Real-cost billing: the customer is charged the DELTA of the upstream pool's
+// reported creditsUsed, not a flat token price. The first request per account seeds
+// the baseline (billed by estimate); subsequent requests bill the real delta.
+func TestCustomApiBillsRealCostDelta(t *testing.T) {
+	t.Setenv("CUSTOM_API_CREDITS_PER_1K_TOKENS", "1.0")
+
+	// Upstream simulates a pool that has no /api/me, deducts 0.02 real credits per
+	// chat call, and reports the running creditsUsed via /checkkey/info.
+	var creditsUsed float64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			w.WriteHeader(http.StatusNotFound)
+		case "/checkkey/info":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"found": true, "creditsUsed": creditsUsed, "creditLimit": 1000.0,
+			})
+		default: // /v1/messages — the chat call deducts real credits upstream.
+			creditsUsed += 0.02
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"id":"m1","usage":{"input_tokens":300,"output_tokens":700}}`))
+		}
+	}))
+	defer upstream.Close()
+
+	acc := config.Account{ID: "cd1", AuthMethod: "custom_api", BaseURL: upstream.URL, KiroApiKey: "sk-up", Enabled: true}
+	h := newCustomApiTestHandler(t, acc)
+
+	forward := func() {
+		t.Helper()
+		if err := h.forwardToUpstream(httptest.NewRecorder(), nil, forwardParams{
+			account: &acc, body: []byte(`{}`), endpoint: "anthropic", streaming: false, model: "x",
+		}); err != nil {
+			t.Fatalf("forward: %v", err)
+		}
+	}
+
+	// Request 1 seeds the baseline: billed by the flat estimate (1000 tok / 1000 * 1.0).
+	forward()
+	afterFirst := h.getCredits()
+	if afterFirst < 0.99 || afterFirst > 1.01 {
+		t.Fatalf("first request should bill estimate ~1.0, got %v", afterFirst)
+	}
+
+	// Request 2 bills the real upstream delta (0.02), NOT another ~1.0 flat charge.
+	forward()
+	delta := h.getCredits() - afterFirst
+	if delta < 0.019 || delta > 0.021 {
+		t.Fatalf("second request should bill real delta ~0.02, got %v", delta)
+	}
+}
+
+// An upstream recharge/reset drops creditsUsed far below our baseline. Billing must
+// re-seed (charge estimate for the crossing request) instead of billing 0 forever
+// until usage climbs back over the stale baseline.
+func TestCustomApiBillingReseedsAfterReset(t *testing.T) {
+	t.Setenv("CUSTOM_API_CREDITS_PER_1K_TOKENS", "1.0")
+
+	var creditsUsed float64 = 500 // account already has heavy prior usage
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			w.WriteHeader(http.StatusNotFound)
+		case "/checkkey/info":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"found": true, "creditsUsed": creditsUsed, "creditLimit": 100000.0,
+			})
+		default:
+			creditsUsed += 0.02
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"id":"m1","usage":{"input_tokens":300,"output_tokens":700}}`))
+		}
+	}))
+	defer upstream.Close()
+
+	acc := config.Account{ID: "cr1", AuthMethod: "custom_api", BaseURL: upstream.URL, KiroApiKey: "sk-up", Enabled: true}
+	h := newCustomApiTestHandler(t, acc)
+	forward := func() {
+		t.Helper()
+		if err := h.forwardToUpstream(httptest.NewRecorder(), nil, forwardParams{
+			account: &acc, body: []byte(`{}`), endpoint: "anthropic", streaming: false, model: "x",
+		}); err != nil {
+			t.Fatalf("forward: %v", err)
+		}
+	}
+
+	forward() // seeds baseline at ~500
+	forward() // steady-state real delta ~0.02
+	base := h.getCredits()
+
+	// Upstream recharge: creditsUsed resets to ~0. Next request must re-seed and bill
+	// the estimate (~1.0), not 0.
+	creditsUsed = 0
+	forward()
+	if delta := h.getCredits() - base; delta < 0.99 || delta > 1.01 {
+		t.Fatalf("post-reset request should re-seed and bill estimate ~1.0, got %v", delta)
 	}
 }
 

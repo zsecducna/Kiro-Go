@@ -1779,13 +1779,15 @@ img.brand-icon {
   opacity: 0.6;
   pointer-events: none;
 }
+/* Compact cards live in a narrow grid column, so the header always stacks: info on
+   top (full width), actions wrap underneath. Prevents the action buttons from
+   squeezing the email/badges into a sliver. */
 .account-header {
   display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 0.75rem;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.625rem;
   margin-bottom: 0.75rem;
-  flex-wrap: wrap;
 }
 .account-info {
   display: flex;
@@ -1798,7 +1800,10 @@ img.brand-icon {
   font-size: 0.9375rem;
   font-weight: 600;
   color: var(--foreground);
-  word-break: break-all;
+  /* Break only when a token is genuinely too long, at any point — never split the
+     masked email char-by-char when there is room. */
+  overflow-wrap: anywhere;
+  word-break: normal;
   line-height: 1.4;
 }
 .account-meta {

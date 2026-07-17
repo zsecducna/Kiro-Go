@@ -225,6 +225,16 @@ type Config struct {
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
 
+	// ProxyURLs is an optional pool of outbound proxies rotated round-robin every
+	// ProxyRotateMinutes. When non-empty it drives the GLOBAL proxy (the single
+	// ProxyURL above is ignored for routing); per-account ProxyURL overrides still
+	// take precedence. Each entry uses the same scheme format as ProxyURL.
+	ProxyURLs []string `json:"proxyURLs,omitempty"`
+
+	// ProxyRotateMinutes is the round-robin interval for ProxyURLs. <=0 falls back to
+	// DefaultProxyRotateMinutes. Ignored when ProxyURLs is empty.
+	ProxyRotateMinutes int `json:"proxyRotateMinutes,omitempty"`
+
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
 	SanitizeClaudeCodePrompt bool `json:"sanitizeClaudeCodePrompt,omitempty"`
@@ -906,6 +916,10 @@ func UpdateEndpointFallback(enabled bool) error {
 	return Save()
 }
 
+// DefaultProxyRotateMinutes is the round-robin interval used when a proxy pool is
+// configured without an explicit (or with a non-positive) ProxyRotateMinutes.
+const DefaultProxyRotateMinutes = 10
+
 // GetProxyURL 获取出站代理地址
 func GetProxyURL() string {
 	cfgLock.RLock()
@@ -913,11 +927,33 @@ func GetProxyURL() string {
 	return cfg.ProxyURL
 }
 
-// UpdateProxySettings 更新出站代理配置
-func UpdateProxySettings(proxyURL string) error {
+// GetProxyURLs returns the outbound proxy rotation pool (may be empty).
+func GetProxyURLs() []string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	// Copy so callers cannot mutate the shared config slice.
+	out := make([]string, len(cfg.ProxyURLs))
+	copy(out, cfg.ProxyURLs)
+	return out
+}
+
+// GetProxyRotateMinutes returns the rotation interval, normalized to a positive value.
+func GetProxyRotateMinutes() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.ProxyRotateMinutes <= 0 {
+		return DefaultProxyRotateMinutes
+	}
+	return cfg.ProxyRotateMinutes
+}
+
+// UpdateProxySettings 更新出站代理配置 (single proxy + rotation pool + interval).
+func UpdateProxySettings(proxyURL string, proxyURLs []string, rotateMinutes int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
+	cfg.ProxyURLs = proxyURLs
+	cfg.ProxyRotateMinutes = rotateMinutes
 	return Save()
 }
 

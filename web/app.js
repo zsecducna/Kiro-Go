@@ -1639,6 +1639,10 @@
   async function loadProxyConfig() {
     const res = await api('/proxy');
     const d = await res.json();
+    // Rotation pool (one proxy URL per line) + interval + current active proxy.
+    if ($('proxyPool')) $('proxyPool').value = Array.isArray(d.proxyURLs) ? d.proxyURLs.join('\n') : '';
+    if ($('proxyRotateMinutes')) $('proxyRotateMinutes').value = d.proxyRotateMinutes || '';
+    if ($('proxyActive')) $('proxyActive').textContent = maskProxyDisplay(d.activeProxyURL || '');
     const url = d.proxyURL || '';
     if (!url) {
       $('proxyType').value = 'none';
@@ -1659,6 +1663,17 @@
       $('proxyFields').classList.add('hidden');
     }
   }
+  // Hide credentials in a proxy URL for display (user:pass@host -> user@host).
+  function maskProxyDisplay(url) {
+    if (!url) return t('settings.proxyNone'); // "Direct (no proxy)"
+    try {
+      const u = new URL(url);
+      if (u.password) u.password = '***';
+      return u.toString();
+    } catch (e) {
+      return url;
+    }
+  }
   function onProxyTypeChange() {
     const type = $('proxyType').value;
     $('proxyFields').classList.toggle('hidden', type === 'none');
@@ -1675,9 +1690,19 @@
       const auth = u ? (p ? encodeURIComponent(u) + ':' + encodeURIComponent(p) + '@' : encodeURIComponent(u) + '@') : '';
       url = type + '://' + auth + host + ':' + port;
     }
-    const res = await api('/proxy', { method: 'POST', body: JSON.stringify({ proxyURL: url }) });
+    // Rotation pool: one proxy URL per line. When non-empty it drives the global
+    // proxy, cycling every proxyRotateMinutes; the single proxy above is the fallback.
+    const proxyURLs = ($('proxyPool') ? $('proxyPool').value : '')
+      .split('\n').map(s => s.trim()).filter(Boolean);
+    const okScheme = s => /^(https?|socks5h?):\/\//.test(s);
+    if (proxyURLs.some(s => !okScheme(s))) { toast(t('settings.proxyFormatError'), 'warning'); return; }
+    const rotateMinutes = parseInt(($('proxyRotateMinutes') ? $('proxyRotateMinutes').value : '') || '0', 10) || 0;
+    const res = await api('/proxy', {
+      method: 'POST',
+      body: JSON.stringify({ proxyURL: url, proxyURLs, proxyRotateMinutes: rotateMinutes })
+    });
     const d = await res.json();
-    if (d.success) toast(t('settings.proxySaved'), 'success');
+    if (d.success) { toast(t('settings.proxySaved'), 'success'); loadProxyConfig(); }
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
   async function saveRequireApiKey() {

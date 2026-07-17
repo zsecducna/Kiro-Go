@@ -64,6 +64,9 @@ type Handler struct {
 	// creditsUsed per account so each forwarded request is billed the real delta
 	// the upstream pool deducted, not a flat token-derived price.
 	customApiLedger *customApiCreditLedger
+	// proxyRotator rotates the global outbound proxy through a configured pool on a
+	// timer (round-robin). Inert when no pool is configured.
+	proxyRotator *proxyRotator
 }
 
 type thinkingStreamSource int
@@ -236,9 +239,6 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 }
 
 func NewHandler() *Handler {
-	// 启动时应用代理配置
-	applyProxyConfig(config.GetProxyURL())
-
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
 		pool:            pool.GetPool(),
@@ -253,6 +253,12 @@ func NewHandler() *Handler {
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 		customApiLedger: newCustomApiCreditLedger(),
 	}
+	// 启动时应用代理配置
+	// Outbound proxy: a rotator applies the global proxy, cycling a pool when one is
+	// configured. When no pool is set it just applies the single ProxyURL once.
+	h.proxyRotator = newProxyRotator(applyProxyConfig)
+	h.proxyRotator.configure(config.GetProxyURL(), config.GetProxyURLs(), config.GetProxyRotateMinutes())
+
 	cachePath := filepath.Join(config.GetConfigDir(), "prompt_cache.json")
 	h.promptCache.Load(cachePath)
 	h.promptCache.startSaveLoop(cachePath, 30*time.Second)
@@ -4544,17 +4550,36 @@ func applyProxyConfig(proxyURL string) {
 	auth.InitHttpClient(proxyURL)
 }
 
-// apiGetProxy 获取当前代理配置
+// apiGetProxy 获取当前代理配置 (single proxy + rotation pool + active proxy)
 func (h *Handler) apiGetProxy(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{
-		"proxyURL": config.GetProxyURL(),
+	active := config.GetProxyURL()
+	if h.proxyRotator != nil {
+		active = h.proxyRotator.activeURL()
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"proxyURL":           config.GetProxyURL(),
+		"proxyURLs":          config.GetProxyURLs(),
+		"proxyRotateMinutes": config.GetProxyRotateMinutes(),
+		"activeProxyURL":     active,
 	})
 }
 
-// apiUpdateProxy 更新代理配置并立即生效
+// isValidProxyScheme reports whether a proxy URL starts with a supported scheme.
+func isValidProxyScheme(u string) bool {
+	return strings.HasPrefix(u, "http://") ||
+		strings.HasPrefix(u, "https://") ||
+		strings.HasPrefix(u, "socks5://") ||
+		strings.HasPrefix(u, "socks5h://")
+}
+
+// apiUpdateProxy 更新代理配置并立即生效. Accepts a single proxyURL plus an optional
+// rotation pool (proxyURLs) and interval (proxyRotateMinutes). When the pool is
+// non-empty the rotator cycles it; otherwise the single proxyURL is applied.
 func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ProxyURL string `json:"proxyURL"`
+		ProxyURL           string   `json:"proxyURL"`
+		ProxyURLs          []string `json:"proxyURLs"`
+		ProxyRotateMinutes int      `json:"proxyRotateMinutes"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4563,25 +4588,43 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 验证代理 URL 格式（非空时）
-	if req.ProxyURL != "" {
-		if !strings.HasPrefix(req.ProxyURL, "http://") &&
-			!strings.HasPrefix(req.ProxyURL, "https://") &&
-			!strings.HasPrefix(req.ProxyURL, "socks5://") &&
-			!strings.HasPrefix(req.ProxyURL, "socks5h://") {
+	if req.ProxyURL != "" && !isValidProxyScheme(req.ProxyURL) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+		return
+	}
+	// Validate and clean every pool entry.
+	cleaned := make([]string, 0, len(req.ProxyURLs))
+	for _, u := range req.ProxyURLs {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		if !isValidProxyScheme(u) {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "each proxy must start with http://, https://, socks5://, or socks5h://: " + u})
 			return
 		}
+		cleaned = append(cleaned, u)
+	}
+	if req.ProxyRotateMinutes < 0 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "proxyRotateMinutes must be >= 0"})
+		return
 	}
 
-	if err := config.UpdateProxySettings(req.ProxyURL); err != nil {
+	if err := config.UpdateProxySettings(req.ProxyURL, cleaned, req.ProxyRotateMinutes); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	// 立即应用新的代理配置
-	applyProxyConfig(req.ProxyURL)
+	// 立即应用新的代理配置 (also (re)starts or stops rotation).
+	if h.proxyRotator != nil {
+		h.proxyRotator.configure(req.ProxyURL, cleaned, config.GetProxyRotateMinutes())
+	} else {
+		applyProxyConfig(req.ProxyURL)
+	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }

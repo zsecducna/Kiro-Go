@@ -1006,12 +1006,9 @@
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
-        // Compact account cards: only token expiry stays. Requests/Tokens/Credits
-        // are intentionally omitted here (still shown per API key) to fit 2-3
-        // cards per row.
-        '<div class="account-stats">' +
-        '<div class="account-stat"><div class="account-stat-value">' + escapeHtml(formatTokenExpiry(a.expiresAt)) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.expiry')) + '</div></div>' +
-        '</div>' +
+        // Compact account cards: no per-account stats row. Requests/Tokens/Credits
+        // and token expiry are intentionally omitted here (usage still shown per
+        // API key) so cards stay small enough to pack 2-3 per row.
         '</div>';
     }).join('');
     applyUsageBars(container);

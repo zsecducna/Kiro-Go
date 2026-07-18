@@ -1,6 +1,11 @@
 # Plan A — OpenAI-compatible surface for Bedrock (prompt 03)
 
-Status: **DESIGN ONLY — awaiting approval. No implementation code until user says go.**
+Status: **IMPLEMENTED** (commit 941ebb1). Files: `proxy/bedrock_openai.go` +
+`doBedrockInvoke` refactor in `proxy/bedrock.go` + two handler branches. Unit +
+synthetic-stream tested; reviewed. Live smoke against a real Claude-on-Bedrock
+model still recommended (prompt 02) before production traffic.
+
+Original design below (kept for reference).
 
 ## Goal
 Route an OpenAI Chat Completions request to a Bedrock account. Today

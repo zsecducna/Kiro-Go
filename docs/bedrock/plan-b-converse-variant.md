@@ -1,7 +1,18 @@
-# Plan B — Converse-based provider variant for non-Claude models (SKETCH)
+# Plan B — Converse-based provider variant for non-Claude models
 
-Status: **DESIGN SKETCH ONLY. Lower priority. Do NOT build unless user explicitly
-says so.** Native Anthropic invoke stays the default for Claude.
+Status: **IMPLEMENTED** (commit 2092f2a), gated behind the opt-in
+`Account.BedrockUseConverse` (default false) so Claude/native paths are
+unaffected. Files: `proxy/bedrock_converse.go` (+ config field, admin
+`useConverse`, routing in the four invoke entrypoints). Unit-tested against the
+documented Converse schema + synthetic streams; reviewed.
+
+**REMAINING GATE — not yet done:** live end-to-end validation against a real
+non-Claude model (Nova/Llama/DeepSeek) enabled in-region. The Converse stream
+framing (no `{bytes}` envelope) and exact delta field shapes are inferred from
+AWS docs/the MIT-0 sample, not exercised on the real wire. Validate before
+enabling for production traffic.
+
+Original design sketch below (kept for reference).
 
 ## Why this is optional
 The current provider posts native Anthropic Messages to `bedrock-runtime`

@@ -99,9 +99,18 @@ func resolveBedrockModelID(account *config.Account, requested string) (string, e
 			}
 		}
 	}
+	// Discovered callable models (populated by apiGetAccountModels / background
+	// discovery): exact or unique-alias match against what this account can
+	// actually invoke. Reads the cache only, never the network.
+	if account != nil {
+		if id := discoveredBedrockModelFor(account.ID, requested); id != "" {
+			return id, nil
+		}
+	}
 	if looksLikeBedrockModelID(requested) {
 		return requested, nil
 	}
+	// Last-resort convenience defaults (may not be callable by this account).
 	if id, ok := defaultBedrockModelMap[requested]; ok {
 		return id, nil
 	}

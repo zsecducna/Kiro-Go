@@ -4487,9 +4487,14 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 	// Custom API accounts serve whatever the linked pool serves: load the model list
 	// from the upstream provider's /v1/models, not from Kiro/AWS.
 	if account.IsBedrock() {
-		ids := make([]string, 0)
-		for _, v := range account.BedrockModelMap {
-			ids = append(ids, v)
+		// Prefer live-discovered callable models (authorizationStatus AUTHORIZED);
+		// fall back to the account/default static map when discovery is unavailable
+		// (e.g. the key lacks bedrock:ListFoundationModels).
+		ids := h.cachedOrDiscoverBedrockModels(account)
+		if len(ids) == 0 {
+			for _, v := range account.BedrockModelMap {
+				ids = append(ids, v)
+			}
 		}
 		if len(ids) == 0 {
 			for _, v := range defaultBedrockModelMap {

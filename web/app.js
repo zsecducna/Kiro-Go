@@ -443,6 +443,14 @@
     const raw = email || (id ? id.substring(0, 12) + '...' : '-');
     return maskEmail(raw);
   }
+  // accountDisplayName prefers the (masked) email, then the nickname (for
+  // account types with no email, e.g. Bedrock / custom_api), then a short id.
+  function accountDisplayName(a) {
+    if (!a) return '-';
+    if (a.email) return getDisplayEmail(a.email, a.id);
+    if (a.nickname && a.nickname.trim()) return a.nickname.trim();
+    return getDisplayEmail('', a.id);
+  }
 
   // Toast bridge
   const toast = function (msg, variant, opts) {
@@ -953,7 +961,7 @@
       const overageBadge = renderOverageBadge(a);
       const banned = a.banStatus && a.banStatus !== 'ACTIVE';
       const idAttr = escapeAttr(a.id);
-      const displayEmail = getDisplayEmail(a.email, a.id);
+      const displayEmail = accountDisplayName(a);
       const selectLabel = t('accounts.selectAccount', displayEmail);
 
       const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
@@ -1494,7 +1502,7 @@
     if (!body) return;
     const acc = getTestAccount(testModalAccountId);
     const idAttr = escapeAttr(testModalAccountId);
-    const email = acc ? getDisplayEmail(acc.email, acc.id) : testModalAccountId;
+    const email = acc ? accountDisplayName(acc) : testModalAccountId;
     const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
     const statusText = testModalLoadingModels
       ? t('accounts.testModelsLoading')
@@ -1571,7 +1579,7 @@
     const modalBtn = $('testRunBtn');
     if (modalBtn) modalBtn.setAttribute('aria-busy', 'true');
     const acc = accountsData.find(a => a.id === id);
-    const email = acc ? getDisplayEmail(acc.email, acc.id) : id;
+    const email = acc ? accountDisplayName(acc) : id;
     const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
     addTestLog(t('accounts.testLog.start', email, model, proxy), 'info');
     try {

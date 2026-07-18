@@ -146,6 +146,30 @@ func bedrockCredsFor(account *config.Account) (awsCredentials, error) {
 	}, nil
 }
 
+// authorizeBedrockRequest attaches authentication to a Bedrock request in place.
+//
+// Two credential styles are supported. When the account carries a Bedrock API key
+// (a bearer token, "ABSK..." — set via BedrockAPIKey), it is used verbatim as an
+// `Authorization: Bearer` header and SigV4 is skipped entirely; this is the newer
+// Bedrock API-key auth and works for principals whose raw IAM access key is denied
+// InvokeModel. Otherwise the account's static IAM access key SigV4-signs the request
+// over payload. region is the SigV4 region (also the request host's region).
+//
+// Returns an error only when neither credential is usable, so callers surface a
+// pre-stream failure and fail over.
+func authorizeBedrockRequest(account *config.Account, req *http.Request, payload []byte, region string) error {
+	if key := strings.TrimSpace(account.BedrockAPIKey); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+		return nil
+	}
+	creds, err := bedrockCredsFor(account)
+	if err != nil {
+		return err
+	}
+	signSigV4(req, payload, creds, region, bedrockService, time.Now())
+	return nil
+}
+
 // bedrockRegionFor returns the account's region, defaulting to us-east-1.
 func bedrockRegionFor(account *config.Account) string {
 	if r := strings.TrimSpace(account.Region); r != "" {
@@ -246,10 +270,6 @@ func (h *Handler) doBedrockInvoke(p forwardParams, anthropicBody []byte, streami
 	if p.account != nil && bedrockThrottle.remaining(p.account.ID, modelID) > 0 {
 		return nil, errBedrockThrottled
 	}
-	creds, err := bedrockCredsFor(p.account)
-	if err != nil {
-		return nil, err
-	}
 	region := bedrockRegionFor(p.account)
 
 	body, err := buildBedrockBody(anthropicBody)
@@ -268,7 +288,9 @@ func (h *Handler) doBedrockInvoke(p forwardParams, anthropicBody []byte, streami
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	signSigV4(req, body, creds, region, bedrockService, time.Now())
+	if err := authorizeBedrockRequest(p.account, req, body, region); err != nil {
+		return nil, err
+	}
 
 	resp, err := bedrockHTTPClient(p.account).Do(req)
 	if err != nil {

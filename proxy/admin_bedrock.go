@@ -20,9 +20,10 @@ import (
 type adminAddBedrockRequest struct {
 	Nickname        string            `json:"nickname,omitempty"`     // Display name (defaults to "Bedrock <region>")
 	Region          string            `json:"region"`                 // AWS region, e.g. us-east-1 (required)
-	AccessKeyID     string            `json:"accessKeyId"`            // IAM access key id (required)
-	SecretAccessKey string            `json:"secretAccessKey"`        // IAM secret (required)
+	AccessKeyID     string            `json:"accessKeyId"`            // IAM access key id (required unless apiKey set)
+	SecretAccessKey string            `json:"secretAccessKey"`        // IAM secret (required unless apiKey set)
 	SessionToken    string            `json:"sessionToken,omitempty"` // Only for STS/temporary credentials
+	APIKey          string            `json:"apiKey,omitempty"`       // Bedrock API key (bearer token, "ABSK..."); alternative to access key/secret
 	ModelMap        map[string]string `json:"modelMap,omitempty"`     // Optional client-model -> Bedrock-model-id overrides
 	UseConverse     bool              `json:"useConverse,omitempty"`  // Use the Converse API (required for non-Anthropic models)
 	ProxyURL        string            `json:"proxyUrl,omitempty"`     // Optional per-account outbound proxy (user:pass@host:port)
@@ -57,11 +58,14 @@ func (h *Handler) addBedrockAccount(req adminAddBedrockRequest) (string, int, er
 	region := strings.TrimSpace(req.Region)
 	ak := strings.TrimSpace(req.AccessKeyID)
 	sk := strings.TrimSpace(req.SecretAccessKey)
+	apiKey := strings.TrimSpace(req.APIKey)
 	if region == "" {
 		return "", http.StatusBadRequest, fmt.Errorf("region is required")
 	}
-	if ak == "" || sk == "" {
-		return "", http.StatusBadRequest, fmt.Errorf("accessKeyId and secretAccessKey are required")
+	// Either a Bedrock API key (bearer token) OR an access key/secret pair authorizes
+	// the account. The API key path skips SigV4 entirely (see authorizeBedrockRequest).
+	if apiKey == "" && (ak == "" || sk == "") {
+		return "", http.StatusBadRequest, fmt.Errorf("provide either apiKey, or both accessKeyId and secretAccessKey")
 	}
 
 	enabled := true
@@ -82,6 +86,7 @@ func (h *Handler) addBedrockAccount(req adminAddBedrockRequest) (string, int, er
 		BedrockAccessKeyID:     ak,
 		BedrockSecretAccessKey: sk,
 		BedrockSessionToken:    strings.TrimSpace(req.SessionToken),
+		BedrockAPIKey:          apiKey,
 		BedrockModelMap:        req.ModelMap,
 		BedrockUseConverse:     req.UseConverse,
 		ProxyURL:               strings.TrimSpace(req.ProxyURL),

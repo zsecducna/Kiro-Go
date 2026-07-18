@@ -2849,6 +2849,44 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
 	}
+	// Editable Bedrock fields — only for bedrock accounts. Region and credentials
+	// change which upstream/model set the account resolves, so clear the cached model
+	// discovery when any of them move. (Region is deliberately NOT editable for Kiro
+	// accounts here: their Region drives OIDC endpoints and must not be changed by a
+	// generic field update.)
+	if existing.IsBedrock() {
+		bedrockChanged := false
+		if v, ok := updates["region"].(string); ok && strings.TrimSpace(v) != existing.Region {
+			existing.Region = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockApiKey"].(string); ok {
+			existing.BedrockAPIKey = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockAccessKeyId"].(string); ok {
+			existing.BedrockAccessKeyID = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockSecretAccessKey"].(string); ok {
+			existing.BedrockSecretAccessKey = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockUseConverse"].(bool); ok {
+			existing.BedrockUseConverse = v
+		}
+		// Guard the same either/or invariant the add endpoint enforces: an update must
+		// not leave the account with no usable credential (it would then fail every
+		// request pre-stream and be perpetually excluded).
+		if existing.BedrockAPIKey == "" && (existing.BedrockAccessKeyID == "" || existing.BedrockSecretAccessKey == "") {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "bedrock account needs either an API key or an access key + secret"})
+			return
+		}
+		if bedrockChanged {
+			clearBedrockModelCache(existing.ID)
+		}
+	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
 		w.WriteHeader(500)

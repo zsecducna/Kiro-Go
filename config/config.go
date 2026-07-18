@@ -78,10 +78,15 @@ type Account struct {
 	// per account; when nil the env BEDROCK_MODEL_MAP and built-in defaults apply.
 	// NOTE: the secret is stored as-is in the config JSON, matching how OAuth tokens
 	// and Kiro API keys are already persisted here; protect the config file at rest.
-	BedrockAccessKeyID     string            `json:"bedrockAccessKeyId,omitempty"`
-	BedrockSecretAccessKey string            `json:"bedrockSecretAccessKey,omitempty"`
-	BedrockSessionToken    string            `json:"bedrockSessionToken,omitempty"` // set only for STS/temporary credentials
-	BedrockModelMap        map[string]string `json:"bedrockModelMap,omitempty"`
+	BedrockAccessKeyID     string `json:"bedrockAccessKeyId,omitempty"`
+	BedrockSecretAccessKey string `json:"bedrockSecretAccessKey,omitempty"`
+	BedrockSessionToken    string `json:"bedrockSessionToken,omitempty"` // set only for STS/temporary credentials
+	// BedrockAPIKey is a Bedrock API key (bearer token, "ABSK..."). When set it is
+	// used as an Authorization: Bearer header and SigV4 is skipped; it authenticates
+	// principals whose raw IAM access key is denied InvokeModel. Either this OR the
+	// access key/secret pair is required for a bedrock account.
+	BedrockAPIKey   string            `json:"bedrockApiKey,omitempty"`
+	BedrockModelMap map[string]string `json:"bedrockModelMap,omitempty"`
 	// BedrockUseConverse opts this account into the Bedrock Converse API path
 	// (bedrock-runtime /converse[-stream]) instead of the native Anthropic invoke
 	// path. Required for non-Anthropic models (Nova, Llama, DeepSeek, ...), which do

@@ -1267,6 +1267,13 @@
       '<button class="btn btn-sm btn-primary" data-detail-action="saveMachineId" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div></div>' +
 
+      (a.authMethod === 'bedrock' ?
+        '<div class="detail-section"><h4>Region</h4><div class="machine-id-row">' +
+        '<input type="text" id="regionInput" value="' + escapeAttr(a.region || 'us-east-1') + '" placeholder="us-east-1 / eu-west-1" />' +
+        '<button class="btn btn-sm btn-primary" data-detail-action="saveRegion" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+        '</div><p class="help-block">AWS region where this account has Bedrock model access. A 400 "Operation not allowed" on invoke usually means the model is enabled in a different region. Saving clears the model cache.</p></div>'
+        : '') +
+
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.weight')) + '</h4>' +
       '<div class="form-group">' +
       '<input type="number" id="weightInput" value="' + (a.weight || 0) + '" min="0" max="10" />' +
@@ -1461,6 +1468,11 @@
       toast(t('detail.proxyFormatError'), 'warning'); return;
     }
     await putAccount(id, { proxyURL: url }, t('detail.proxySaved'));
+  }
+  async function saveRegion(id) {
+    const region = $('regionInput').value.trim();
+    if (!region) { toast('Region cannot be empty', 'warning'); return; }
+    await putAccount(id, { region: region }, 'Region saved');
   }
   function closeDetailModal() { closeDialog('detailModal'); }
 
@@ -2429,14 +2441,16 @@
   function modalBedrock(title, body) {
     title.textContent = 'Amazon Bedrock';
     body.innerHTML =
-      '<p class="help-block">Native Bedrock account: static IAM access key, SigV4-signed. Enable Converse for non-Claude models (Nova/Llama/DeepSeek).</p>' +
+      '<p class="help-block">Native Bedrock account. Authenticate with EITHER a Bedrock API key (bearer token) OR an IAM access key/secret (SigV4). Region is where your model access is granted (e.g. eu-west-1). Enable Converse for non-Claude models (Nova/Llama/DeepSeek).</p>' +
       '<div class="form-group"><label>Nickname</label>' +
-      '<input type="text" id="bedrockNickname" placeholder="Bedrock us-east-1" /></div>' +
+      '<input type="text" id="bedrockNickname" placeholder="Bedrock eu-west-1" /></div>' +
       '<div class="form-group"><label>Region</label>' +
-      '<input type="text" id="bedrockRegion" value="us-east-1" /></div>' +
-      '<div class="form-group"><label>Access Key ID</label>' +
+      '<input type="text" id="bedrockRegion" value="us-east-1" placeholder="us-east-1 / eu-west-1" /></div>' +
+      '<div class="form-group"><label>Bedrock API Key <span class="muted-text">(bearer token, ABSK…; leave blank to use access key)</span></label>' +
+      '<input type="password" id="bedrockApiKey" class="font-mono" placeholder="ABSK..." /></div>' +
+      '<div class="form-group"><label>Access Key ID <span class="muted-text">(if no API key)</span></label>' +
       '<input type="text" id="bedrockAccessKeyId" class="font-mono" placeholder="AKIA..." /></div>' +
-      '<div class="form-group"><label>Secret Access Key</label>' +
+      '<div class="form-group"><label>Secret Access Key <span class="muted-text">(if no API key)</span></label>' +
       '<input type="password" id="bedrockSecretAccessKey" class="font-mono" placeholder="secret" /></div>' +
       '<div class="form-group"><label>Session Token <span class="muted-text">(optional, STS only)</span></label>' +
       '<input type="text" id="bedrockSessionToken" class="font-mono" placeholder="" /></div>' +
@@ -2453,9 +2467,11 @@
   }
   async function addBedrockAccount() {
     const region = $('bedrockRegion').value.trim();
+    const apiKey = $('bedrockApiKey').value.trim();
     const accessKeyId = $('bedrockAccessKeyId').value.trim();
     const secretAccessKey = $('bedrockSecretAccessKey').value.trim();
-    if (!region || !accessKeyId || !secretAccessKey) return toastWarning('Region, Access Key ID and Secret Access Key are required');
+    if (!region) return toastWarning('Region is required');
+    if (!apiKey && (!accessKeyId || !secretAccessKey)) return toastWarning('Provide either a Bedrock API key, or both Access Key ID and Secret Access Key');
     let modelMap;
     const mmRaw = $('bedrockModelMap').value.trim();
     if (mmRaw) {
@@ -2464,6 +2480,7 @@
     const payload = {
       nickname: $('bedrockNickname').value.trim(),
       region: region,
+      apiKey: apiKey,
       accessKeyId: accessKeyId,
       secretAccessKey: secretAccessKey,
       sessionToken: $('bedrockSessionToken').value.trim(),
@@ -3355,6 +3372,7 @@
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);
+      else if (a === 'saveRegion') saveRegion(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
     });

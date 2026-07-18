@@ -672,10 +672,6 @@ func (h *Handler) doBedrockConverseInvoke(p forwardParams, converseBody []byte, 
 	if p.account != nil && bedrockThrottle.remaining(p.account.ID, modelID) > 0 {
 		return nil, errBedrockThrottled
 	}
-	creds, err := bedrockCredsFor(p.account)
-	if err != nil {
-		return nil, err
-	}
 	region := bedrockRegionFor(p.account)
 
 	rawURL := bedrockConverseEndpoint(region, modelID, streaming)
@@ -688,7 +684,9 @@ func (h *Handler) doBedrockConverseInvoke(p forwardParams, converseBody []byte, 
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	signSigV4(req, converseBody, creds, region, bedrockService, time.Now())
+	if err := authorizeBedrockRequest(p.account, req, converseBody, region); err != nil {
+		return nil, err
+	}
 
 	resp, err := bedrockHTTPClient(p.account).Do(req)
 	if err != nil {

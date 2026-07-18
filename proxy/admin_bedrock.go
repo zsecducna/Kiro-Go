@@ -24,6 +24,7 @@ type adminAddBedrockRequest struct {
 	SecretAccessKey string            `json:"secretAccessKey"`        // IAM secret (required unless apiKey set)
 	SessionToken    string            `json:"sessionToken,omitempty"` // Only for STS/temporary credentials
 	APIKey          string            `json:"apiKey,omitempty"`       // Bedrock API key (bearer token, "ABSK..."); alternative to access key/secret
+	Regions         []string          `json:"regions,omitempty"`      // Extra candidate regions beyond Region (per-region model access)
 	ModelMap        map[string]string `json:"modelMap,omitempty"`     // Optional client-model -> Bedrock-model-id overrides
 	UseConverse     bool              `json:"useConverse,omitempty"`  // Use the Converse API (required for non-Anthropic models)
 	ProxyURL        string            `json:"proxyUrl,omitempty"`     // Optional per-account outbound proxy (user:pass@host:port)
@@ -87,6 +88,7 @@ func (h *Handler) addBedrockAccount(req adminAddBedrockRequest) (string, int, er
 		BedrockSecretAccessKey: sk,
 		BedrockSessionToken:    strings.TrimSpace(req.SessionToken),
 		BedrockAPIKey:          apiKey,
+		BedrockRegions:         cleanRegionList(req.Regions),
 		BedrockModelMap:        req.ModelMap,
 		BedrockUseConverse:     req.UseConverse,
 		ProxyURL:               strings.TrimSpace(req.ProxyURL),

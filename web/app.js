@@ -1271,7 +1271,11 @@
         '<div class="detail-section"><h4>Region</h4><div class="machine-id-row">' +
         '<input type="text" id="regionInput" value="' + escapeAttr(a.region || 'us-east-1') + '" placeholder="us-east-1 / eu-west-1" />' +
         '<button class="btn btn-sm btn-primary" data-detail-action="saveRegion" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
-        '</div><p class="help-block">AWS region where this account has Bedrock model access. A 400 "Operation not allowed" on invoke usually means the model is enabled in a different region. Saving clears the model cache.</p></div>'
+        '</div><p class="help-block">Primary AWS region. A 400 "Operation not allowed" on invoke usually means the model is enabled in a different region. Saving clears the model + region cache.</p></div>' +
+        '<div class="detail-section"><h4>Extra Regions</h4><div class="machine-id-row">' +
+        '<input type="text" id="regionsInput" value="' + escapeAttr((a.bedrockRegions || []).join(', ')) + '" placeholder="eu-west-1, us-west-2" />' +
+        '<button class="btn btn-sm btn-primary" data-detail-action="saveRegions" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+        '</div><p class="help-block">Comma-separated fallback regions. On "Operation not allowed" the server tries these (primary first) and learns which region each model is callable in. Refresh Models prewarms the map.</p></div>'
         : '') +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.weight')) + '</h4>' +
@@ -1338,10 +1342,15 @@
         });
         c.innerHTML = sorted.map(m => {
           const ratio = m.rateMultiplier || 1;
+          // Bedrock rows carry a learned callable region ("" = not yet probed).
+          const regionBadge = (m.region !== undefined)
+            ? '<div class="model-info">' + (m.region ? '📍 ' + escapeHtml(m.region) : '<span class="muted-text">region not probed</span>') + '</div>'
+            : '';
           return '<div class="model-item">' +
             '<div class="model-name">' + escapeHtml(m.modelId) + '</div>' +
             '<div class="model-credit"><span class="credit-ratio">' + escapeHtml(t('detail.creditMultiplier', ratio)) + '</span></div>' +
             '<div class="model-info">' + escapeHtml(m.description || '') + '</div>' +
+            regionBadge +
             '</div>';
         }).join('') || '<p class="empty-state">' + escapeHtml(t('detail.noModels')) + '</p>';
       } else {
@@ -1473,6 +1482,10 @@
     const region = $('regionInput').value.trim();
     if (!region) { toast('Region cannot be empty', 'warning'); return; }
     await putAccount(id, { region: region }, 'Region saved');
+  }
+  async function saveRegions(id) {
+    const regions = $('regionsInput').value.split(',').map(s => s.trim()).filter(Boolean);
+    await putAccount(id, { bedrockRegions: regions }, 'Extra regions saved');
   }
   function closeDetailModal() { closeDialog('detailModal'); }
 
@@ -2446,6 +2459,8 @@
       '<input type="text" id="bedrockNickname" placeholder="Bedrock eu-west-1" /></div>' +
       '<div class="form-group"><label>Region</label>' +
       '<input type="text" id="bedrockRegion" value="us-east-1" placeholder="us-east-1 / eu-west-1" /></div>' +
+      '<div class="form-group"><label>Extra Regions <span class="muted-text">(comma-separated, optional)</span></label>' +
+      '<input type="text" id="bedrockRegions" placeholder="eu-west-1, us-west-2" /></div>' +
       '<div class="form-group"><label>Bedrock API Key <span class="muted-text">(bearer token, ABSK…; leave blank to use access key)</span></label>' +
       '<input type="password" id="bedrockApiKey" class="font-mono" placeholder="ABSK..." /></div>' +
       '<div class="form-group"><label>Access Key ID <span class="muted-text">(if no API key)</span></label>' +
@@ -2480,6 +2495,7 @@
     const payload = {
       nickname: $('bedrockNickname').value.trim(),
       region: region,
+      regions: $('bedrockRegions').value.split(',').map(s => s.trim()).filter(Boolean),
       apiKey: apiKey,
       accessKeyId: accessKeyId,
       secretAccessKey: secretAccessKey,
@@ -3373,6 +3389,7 @@
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);
       else if (a === 'saveRegion') saveRegion(id);
+      else if (a === 'saveRegions') saveRegions(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
     });

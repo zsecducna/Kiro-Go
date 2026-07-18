@@ -662,44 +662,27 @@ func (c *converseStreamConv) finalize(emit emitFn) error {
 // ---------------------------------------------------------------------------
 
 // doBedrockConverseInvoke builds, signs, and sends a Converse request. Mirrors
-// doBedrockInvoke but targets the /converse[-stream] endpoint with a Converse
-// body (no anthropic_version). All returned errors occur before any client bytes.
+// doBedrockInvoke but targets the /converse[-stream] endpoint with a Converse body
+// (no anthropic_version). Region selection, auth, throttle and access-error region
+// hopping are delegated to invokeBedrockRegional. All returned errors occur before
+// any client bytes.
 func (h *Handler) doBedrockConverseInvoke(p forwardParams, converseBody []byte, streaming bool) (*http.Response, error) {
 	modelID, err := resolveBedrockModelID(p.account, p.model)
 	if err != nil {
 		return nil, err
 	}
-	if p.account != nil && bedrockThrottle.remaining(p.account.ID, modelID) > 0 {
-		return nil, errBedrockThrottled
-	}
-	region := bedrockRegionFor(p.account)
-
-	rawURL := bedrockConverseEndpoint(region, modelID, streaming)
-	req, err := newBedrockRequestForURL(rawURL, converseBody)
-	if err != nil {
-		return nil, err
-	}
-	if streaming {
-		req.Header.Set("Accept", "application/vnd.amazon.eventstream")
-	} else {
-		req.Header.Set("Accept", "application/json")
-	}
-	if err := authorizeBedrockRequest(p.account, req, converseBody, region); err != nil {
-		return nil, err
-	}
-
-	resp, err := bedrockHTTPClient(p.account).Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("bedrock: request failed: %w", err)
-	}
-	if resp.StatusCode == http.StatusTooManyRequests {
-		if p.account != nil {
-			noteBedrockResponseThrottle(p.account.ID, modelID, resp)
+	return h.invokeBedrockRegional(p, modelID, converseBody, func(region string) (*http.Request, error) {
+		req, err := newBedrockRequestForURL(bedrockConverseEndpoint(region, modelID, streaming), converseBody)
+		if err != nil {
+			return nil, err
 		}
-		resp.Body.Close()
-		return nil, errBedrockThrottled
-	}
-	return resp, nil
+		if streaming {
+			req.Header.Set("Accept", "application/vnd.amazon.eventstream")
+		} else {
+			req.Header.Set("Accept", "application/json")
+		}
+		return req, nil
+	})
 }
 
 // ---------------------------------------------------------------------------

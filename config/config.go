@@ -85,7 +85,12 @@ type Account struct {
 	// used as an Authorization: Bearer header and SigV4 is skipped; it authenticates
 	// principals whose raw IAM access key is denied InvokeModel. Either this OR the
 	// access key/secret pair is required for a bedrock account.
-	BedrockAPIKey   string            `json:"bedrockApiKey,omitempty"`
+	BedrockAPIKey string `json:"bedrockApiKey,omitempty"`
+	// BedrockRegions are EXTRA candidate regions (beyond Region) to try for this
+	// account. Bedrock model access is per-region: a model denied in the primary
+	// region may be callable in another. The request path tries Region first, then
+	// these, caching the callable region per model. Empty = single-region (Region).
+	BedrockRegions  []string          `json:"bedrockRegions,omitempty"`
 	BedrockModelMap map[string]string `json:"bedrockModelMap,omitempty"`
 	// BedrockUseConverse opts this account into the Bedrock Converse API path
 	// (bedrock-runtime /converse[-stream]) instead of the native Anthropic invoke

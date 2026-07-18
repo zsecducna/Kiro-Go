@@ -46,6 +46,11 @@ func bedrockHTTPClient(account *config.Account) *http.Client {
 	return &http.Client{Timeout: 5 * time.Minute}
 }
 
+// bedrockHTTPClientFor is the seam invokeBedrockRegional uses to obtain its HTTP
+// client. It defaults to bedrockHTTPClient; tests override it to inject a hermetic
+// client (avoiding the process-wide http.ProxyFromEnvironment cache).
+var bedrockHTTPClientFor = bedrockHTTPClient
+
 // defaultBedrockModelMap maps common Anthropic model aliases the client might send
 // to Bedrock inference-profile IDs. It is a CONVENIENCE default only and is fully
 // overridable per-account (Account.BedrockModelMap) or globally (env
@@ -253,60 +258,36 @@ func extractAnthropicReplyText(body []byte) string {
 	return strings.Join(parts, "")
 }
 
-// doBedrockInvoke builds, signs, and sends a Bedrock invoke request for an
-// already-Anthropic-format body. It centralizes model resolution, credential
-// lookup, body rewrite, SigV4 signing, and the per-account HTTP client so the
-// streaming/non-streaming and Anthropic/OpenAI paths all sign through one site.
-// The returned response body is the caller's to close. All returned errors occur
-// before any client bytes, so callers may fail over.
+// doBedrockInvoke builds, signs, and sends a Bedrock native-invoke request for an
+// already-Anthropic-format body. Model resolution, body rewrite and per-account HTTP
+// client live here; region selection, auth, throttle and the 429/access-error
+// handling are delegated to invokeBedrockRegional so the account's candidate regions
+// are tried and the callable one is learned/cached. The returned response body is
+// the caller's to close. All returned errors occur before any client bytes, so
+// callers may fail over.
 func (h *Handler) doBedrockInvoke(p forwardParams, anthropicBody []byte, streaming bool) (*http.Response, error) {
 	modelID, err := resolveBedrockModelID(p.account, p.model)
 	if err != nil {
 		return nil, err
 	}
-	// Adaptive throttle: skip a model still in a 429 cooldown so the caller fails
-	// over instead of hammering it. Keyed on the resolved model id so aliases share
-	// one cooldown.
-	if p.account != nil && bedrockThrottle.remaining(p.account.ID, modelID) > 0 {
-		return nil, errBedrockThrottled
-	}
-	region := bedrockRegionFor(p.account)
-
 	body, err := buildBedrockBody(anthropicBody)
 	if err != nil {
 		return nil, err
 	}
-
-	req, err := newBedrockRequest(region, modelID, streaming, body)
-	if err != nil {
-		return nil, err
-	}
-	// Bedrock returns AWS event-stream framing for streaming invokes and plain
-	// JSON otherwise; set Accept to match so the wire format is unambiguous.
-	if streaming {
-		req.Header.Set("Accept", "application/vnd.amazon.eventstream")
-	} else {
-		req.Header.Set("Accept", "application/json")
-	}
-	if err := authorizeBedrockRequest(p.account, req, body, region); err != nil {
-		return nil, err
-	}
-
-	resp, err := bedrockHTTPClient(p.account).Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("bedrock: request failed: %w", err)
-	}
-	// A 429 arms the per-(account,model) cooldown and surfaces as the throttle
-	// sentinel so the handler fails over WITHOUT triggering the account-wide quota
-	// cooldown (which would bench the account's other models for an hour).
-	if resp.StatusCode == http.StatusTooManyRequests {
-		if p.account != nil {
-			noteBedrockResponseThrottle(p.account.ID, modelID, resp)
+	return h.invokeBedrockRegional(p, modelID, body, func(region string) (*http.Request, error) {
+		req, err := newBedrockRequest(region, modelID, streaming, body)
+		if err != nil {
+			return nil, err
 		}
-		resp.Body.Close()
-		return nil, errBedrockThrottled
-	}
-	return resp, nil
+		// Bedrock returns AWS event-stream framing for streaming invokes and plain
+		// JSON otherwise; set Accept to match so the wire format is unambiguous.
+		if streaming {
+			req.Header.Set("Accept", "application/vnd.amazon.eventstream")
+		} else {
+			req.Header.Set("Accept", "application/json")
+		}
+		return req, nil
+	})
 }
 
 // invokeBedrockStream performs a streaming Bedrock call and re-emits each inner

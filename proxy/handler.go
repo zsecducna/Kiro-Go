@@ -807,9 +807,15 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 		account.ExpiresAt = latest.ExpiresAt
 		account.ProfileArn = latest.ProfileArn
 	}
-	// An explicit refresh should re-run Bedrock discovery, not reuse the cache.
+	// An explicit refresh should re-run Bedrock discovery, not reuse the cache, and
+	// re-learn which region each model is callable in.
 	if account.IsBedrock() {
 		clearBedrockModelCache(account.ID)
+		clearBedrockRegionRoutes(account.ID)
+		// Prewarm the per-model callable region in the background (opt-in cost: one
+		// tiny invoke per model per candidate region). The response returns as soon
+		// as discovery is cached; the region map fills in shortly after.
+		go func(acc config.Account) { h.prewarmBedrockRegions(&acc) }(*account)
 	}
 	if err := h.fetchAndCacheAccountModels(account); err != nil {
 		w.WriteHeader(500)
@@ -2875,6 +2881,18 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 		if v, ok := updates["bedrockUseConverse"].(bool); ok {
 			existing.BedrockUseConverse = v
 		}
+		// bedrockRegions is a JSON array of extra candidate regions; accept string
+		// items and drop blanks.
+		if v, ok := updates["bedrockRegions"].([]interface{}); ok {
+			var regions []string
+			for _, item := range v {
+				if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+					regions = append(regions, strings.TrimSpace(s))
+				}
+			}
+			existing.BedrockRegions = regions
+			bedrockChanged = true
+		}
 		// Guard the same either/or invariant the add endpoint enforces: an update must
 		// not leave the account with no usable credential (it would then fail every
 		// request pre-stream and be perpetually excluded).
@@ -2885,6 +2903,7 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 		}
 		if bedrockChanged {
 			clearBedrockModelCache(existing.ID)
+			clearBedrockRegionRoutes(existing.ID)
 		}
 	}
 
@@ -4579,13 +4598,19 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 			}
 		}
 		// The panel expects {success, models:[{modelId}]} (same shape as custom_api),
-		// not a bare string array.
+		// not a bare string array. Annotate each model with its learned callable
+		// region (from lazy routing / prewarm) when known, so the UI can show where a
+		// model actually works. "region": "" means not yet probed.
 		models := make([]map[string]interface{}, 0, len(ids))
-		for _, id := range ids {
-			models = append(models, map[string]interface{}{"modelId": id})
+		for _, mid := range ids {
+			region := ""
+			if r, ok := getBedrockRoute(account.ID, mid); ok && r.callable {
+				region = r.region
+			}
+			models = append(models, map[string]interface{}{"modelId": mid, "region": region})
 		}
 		h.pool.SetModelList(account.ID, ids)
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models})
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models, "candidateRegions": candidateRegions(account)})
 		return
 	}
 	if account.IsCustomApi() {

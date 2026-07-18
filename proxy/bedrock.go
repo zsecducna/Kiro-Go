@@ -152,6 +152,48 @@ func bedrockEndpoint(region, modelID string, streaming bool) string {
 	return fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/%s", region, modelID, verb)
 }
 
+// doBedrockInvoke builds, signs, and sends a Bedrock invoke request for an
+// already-Anthropic-format body. It centralizes model resolution, credential
+// lookup, body rewrite, SigV4 signing, and the per-account HTTP client so the
+// streaming/non-streaming and Anthropic/OpenAI paths all sign through one site.
+// The returned response body is the caller's to close. All returned errors occur
+// before any client bytes, so callers may fail over.
+func (h *Handler) doBedrockInvoke(p forwardParams, anthropicBody []byte, streaming bool) (*http.Response, error) {
+	modelID, err := resolveBedrockModelID(p.account, p.model)
+	if err != nil {
+		return nil, err
+	}
+	creds, err := bedrockCredsFor(p.account)
+	if err != nil {
+		return nil, err
+	}
+	region := bedrockRegionFor(p.account)
+
+	body, err := buildBedrockBody(anthropicBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := newBedrockRequest(region, modelID, streaming, body)
+	if err != nil {
+		return nil, err
+	}
+	// Bedrock returns AWS event-stream framing for streaming invokes and plain
+	// JSON otherwise; set Accept to match so the wire format is unambiguous.
+	if streaming {
+		req.Header.Set("Accept", "application/vnd.amazon.eventstream")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
+	signSigV4(req, body, creds, region, bedrockService, time.Now())
+
+	resp, err := bedrockHTTPClient(p.account).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("bedrock: request failed: %w", err)
+	}
+	return resp, nil
+}
+
 // invokeBedrockStream performs a streaming Bedrock call and re-emits each inner
 // Anthropic event to the client as SSE, then bills the customer key. It mirrors
 // forwardToUpstream's contract: returns nil once a response has been (at least
@@ -159,31 +201,10 @@ func bedrockEndpoint(region, modelID string, streaming bool) string {
 // over to another account.
 func (h *Handler) invokeBedrockStream(w http.ResponseWriter, flusher http.Flusher, p forwardParams) error {
 	reqStart := time.Now()
-	modelID, err := resolveBedrockModelID(p.account, p.model)
-	if err != nil {
-		return err
-	}
-	creds, err := bedrockCredsFor(p.account)
-	if err != nil {
-		return err
-	}
-	region := bedrockRegionFor(p.account)
 
-	body, err := buildBedrockBody(p.body)
+	resp, err := h.doBedrockInvoke(p, p.body, true)
 	if err != nil {
 		return err
-	}
-
-	req, err := newBedrockRequest(region, modelID, true, body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/vnd.amazon.eventstream")
-	signSigV4(req, body, creds, region, bedrockService, time.Now())
-
-	resp, err := bedrockHTTPClient(p.account).Do(req)
-	if err != nil {
-		return fmt.Errorf("bedrock: request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -242,31 +263,10 @@ func (h *Handler) invokeBedrockStream(w http.ResponseWriter, flusher http.Flushe
 // response to the client, and bills the customer key.
 func (h *Handler) invokeBedrockNonStream(w http.ResponseWriter, p forwardParams) error {
 	reqStart := time.Now()
-	modelID, err := resolveBedrockModelID(p.account, p.model)
-	if err != nil {
-		return err
-	}
-	creds, err := bedrockCredsFor(p.account)
-	if err != nil {
-		return err
-	}
-	region := bedrockRegionFor(p.account)
 
-	body, err := buildBedrockBody(p.body)
+	resp, err := h.doBedrockInvoke(p, p.body, false)
 	if err != nil {
 		return err
-	}
-
-	req, err := newBedrockRequest(region, modelID, false, body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	signSigV4(req, body, creds, region, bedrockService, time.Now())
-
-	resp, err := bedrockHTTPClient(p.account).Do(req)
-	if err != nil {
-		return fmt.Errorf("bedrock: request failed: %w", err)
 	}
 	defer resp.Body.Close()
 

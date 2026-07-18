@@ -1875,13 +1875,23 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			continue
 		}
 
-		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		// Native Bedrock accounts serve the OpenAI wire format by converting the
+		// request to Anthropic Messages, invoking Bedrock, and converting the
+		// Anthropic SSE back to OpenAI chunks. Same passthrough/failover contract
+		// as custom_api: success ends the request; a pre-stream error fails over.
 		if account.IsBedrock() {
-			// Bedrock is not wired for the OpenAI wire format yet; skip so it
-			// is not mis-served by the Kiro translation path.
-			excluded[account.ID] = true
-			continue
+			if bErr := h.invokeBedrockOpenAIStream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, bErr)
+				continue
+			}
+			return
 		}
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
 		if account.IsCustomApi() {
 			// Already forwarded once: don't add another hop, and don't penalize this
 			// healthy account (loop-guard is not a failure) — just skip it. The account
@@ -2301,13 +2311,22 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			continue
 		}
 
-		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		// Native Bedrock accounts serve OpenAI by converting to Anthropic, invoking
+		// Bedrock, and converting the Anthropic JSON response back to an OpenAI
+		// chat.completion. Success ends the request; a pre-reply error fails over.
 		if account.IsBedrock() {
-			// Bedrock is not wired for the OpenAI wire format yet; skip so it
-			// is not mis-served by the Kiro translation path.
-			excluded[account.ID] = true
-			continue
+			if bErr := h.invokeBedrockOpenAINonStream(w, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, bErr)
+				continue
+			}
+			return
 		}
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
 		if account.IsCustomApi() {
 			// Already forwarded once: don't add another hop, and don't penalize this
 			// healthy account (loop-guard is not a failure) — just skip it. The account

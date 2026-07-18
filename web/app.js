@@ -2111,7 +2111,8 @@
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
     cookie: 'fa-solid fa-cookie-bite',
-    apikey: 'fa-solid fa-lock'
+    apikey: 'fa-solid fa-lock',
+    bedrock: 'fa-brands fa-aws'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -2138,6 +2139,7 @@
     else if (type === 'cookie') modalCookie(title, body);
     else if (type === 'apikey') modalApiKey(title, body);
     else if (type === 'customapi') modalCustomApi(title, body);
+    else if (type === 'bedrock') modalBedrock(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -2168,6 +2170,7 @@
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
       methodCard('apikey', t('modal.apiKeyTitle'), t('modal.apiKeyDesc')) +
       methodCard('customapi', t('modal.customApiTitle'), t('modal.customApiDesc')) +
+      methodCard('bedrock', 'Amazon Bedrock', 'Add a native Bedrock account (static IAM key, SigV4). Converse for non-Claude models.') +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -2402,6 +2405,74 @@
       if (res.ok && d.success) {
         closeModal(); loadAccounts(); loadStats();
         toastPrimary(t('customApi.success'));
+        autoRefreshNewAccount(d.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch {
+      toastError(t('common.failed'));
+    }
+  }
+  // modalBedrock renders the native Amazon Bedrock add form. A Bedrock account
+  // calls Bedrock Runtime directly with a static IAM access key (SigV4-signed).
+  // Enable "Use Converse" for non-Anthropic models (Nova/Llama/DeepSeek); leave it
+  // off for Claude models (native Anthropic invoke). Posts to
+  // /admin/add_bedrock_account (admin-key auth, same as the custom_api route).
+  function modalBedrock(title, body) {
+    title.textContent = 'Amazon Bedrock';
+    body.innerHTML =
+      '<p class="help-block">Native Bedrock account: static IAM access key, SigV4-signed. Enable Converse for non-Claude models (Nova/Llama/DeepSeek).</p>' +
+      '<div class="form-group"><label>Nickname</label>' +
+      '<input type="text" id="bedrockNickname" placeholder="Bedrock us-east-1" /></div>' +
+      '<div class="form-group"><label>Region</label>' +
+      '<input type="text" id="bedrockRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>Access Key ID</label>' +
+      '<input type="text" id="bedrockAccessKeyId" class="font-mono" placeholder="AKIA..." /></div>' +
+      '<div class="form-group"><label>Secret Access Key</label>' +
+      '<input type="password" id="bedrockSecretAccessKey" class="font-mono" placeholder="secret" /></div>' +
+      '<div class="form-group"><label>Session Token <span class="muted-text">(optional, STS only)</span></label>' +
+      '<input type="text" id="bedrockSessionToken" class="font-mono" placeholder="" /></div>' +
+      '<div class="form-group"><label><input type="checkbox" id="bedrockUseConverse" /> Use Converse API (non-Claude models)</label></div>' +
+      '<div class="form-group"><label>Model Map <span class="muted-text">(JSON, optional)</span></label>' +
+      '<textarea id="bedrockModelMap" class="font-mono" rows="3" placeholder=\'{"nova":"us.amazon.nova-lite-v1:0"}\'></textarea></div>' +
+      '<div class="form-group"><label>Proxy URL <span class="muted-text">(optional)</span></label>' +
+      '<input type="text" id="bedrockProxyUrl" class="font-mono" placeholder="http://user:pass@host:port" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="addBedrockBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('addBedrockBtn').addEventListener('click', addBedrockAccount);
+  }
+  async function addBedrockAccount() {
+    const region = $('bedrockRegion').value.trim();
+    const accessKeyId = $('bedrockAccessKeyId').value.trim();
+    const secretAccessKey = $('bedrockSecretAccessKey').value.trim();
+    if (!region || !accessKeyId || !secretAccessKey) return toastWarning('Region, Access Key ID and Secret Access Key are required');
+    let modelMap;
+    const mmRaw = $('bedrockModelMap').value.trim();
+    if (mmRaw) {
+      try { modelMap = JSON.parse(mmRaw); } catch { return toastWarning('Model Map must be valid JSON'); }
+    }
+    const payload = {
+      nickname: $('bedrockNickname').value.trim(),
+      region: region,
+      accessKeyId: accessKeyId,
+      secretAccessKey: secretAccessKey,
+      sessionToken: $('bedrockSessionToken').value.trim(),
+      useConverse: $('bedrockUseConverse').checked,
+      proxyUrl: $('bedrockProxyUrl').value.trim()
+    };
+    if (modelMap) payload.modelMap = modelMap;
+    try {
+      const res = await fetch('/admin/add_bedrock_account', {
+        method: 'POST',
+        headers: { 'X-Admin-Password': password, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const d = await res.json();
+      if (res.ok && d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary('Bedrock account added');
         autoRefreshNewAccount(d.id);
       } else {
         toastError(t('common.failed') + ': ' + (d.error || ''));

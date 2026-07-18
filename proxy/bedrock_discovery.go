@@ -10,19 +10,28 @@ package proxy
 //     INFERENCE_PROFILE-only and PROVISIONED-only ids 400 on a bare invoke, so
 //     they are excluded here — the INFERENCE_PROFILE ones come back via their
 //     us./eu. inference-profile id from ListInferenceProfiles instead.
-//   - GetFoundationModelAvailability authorizationStatus: NOT trusted. This
-//     gateway reports NOT_AUTHORIZED even for models that invoke fine, so probing
-//     it would hide usable models. It is deliberately not called.
+//   - GetFoundationModelAvailability: trusted, but only the agreement field.
+//     authorizationStatus is NOT_AUTHORIZED for EVERY model (an IAM/console flag)
+//     and entitlementAvailability is AVAILABLE for every model on an
+//     enableAccessToAllModelsByDefault account — both non-discriminating. The
+//     discriminating gate is agreementAvailability.status == "AVAILABLE": true for
+//     models that invoke (Nova, Llama, Mistral, DeepSeek), false for models whose
+//     access agreement / use-case form hasn't been accepted (Claude, Cohere, AI21
+//     on a fresh account). Verified live to match invoke ground truth.
 //
 // Discovery therefore = ListFoundationModels (kept: ON_DEMAND text) UNION
-// ListInferenceProfiles (the callable cross-region ids), deduped. Results are
+// ListInferenceProfiles (callable cross-region ids), then filtered by a per-model
+// availability probe keeping only agreement-AVAILABLE ids. The filter EXCLUDES only
+// on a determinate not-callable verdict, so a wholly unreachable availability API
+// degrades to the full on-demand catalog instead of emptying the pool. Results are
 // cached per account so the hot path (resolveBedrockModelID) and apiGetAccountModels
 // read the cache, never the network. All calls reuse the same hand-rolled SigV4
 // signer against the bedrock (control-plane) host.
 //
-// NOTE: ON_DEMAND is the static "callable as a bare id" gate. Per-model throughput
-// limits (RPM/TPM) are a separate concern surfaced at invoke time as HTTP 429;
-// exposing them would require the Service Quotas API and is a future follow-up.
+// NOTE: agreement-AVAILABLE is the reachable "callable" gate. AWS Service Quotas
+// (the source of literal per-model RPM/TPM numbers) returns UnknownOperationException
+// on this deployment and is unusable; per-model throughput limits otherwise surface
+// at invoke time as HTTP 429 and are handled by the adaptive throttle cooldown.
 
 import (
 	"context"
@@ -76,6 +85,34 @@ type bedrockInferenceProfilesResponse struct {
 		InferenceProfileID string `json:"inferenceProfileId"`
 		Status             string `json:"status"`
 	} `json:"inferenceProfileSummaries"`
+}
+
+// bedrockAvailability is the subset of a GetFoundationModelAvailability response
+// that actually gates callability. Verified live on a root account:
+//   - authorizationStatus is NOT_AUTHORIZED for EVERY model (an IAM/console-level
+//     flag), even ones that invoke fine — so it is NOT a callability signal.
+//   - entitlementAvailability is AVAILABLE for every model on an
+//     enableAccessToAllModelsByDefault account — also non-discriminating.
+//   - agreementAvailability.status IS discriminating: AVAILABLE for models that
+//     invoke (Nova, Llama, Mistral, DeepSeek) and NOT_AVAILABLE for models whose
+//     access agreement / use-case form has not been accepted (Claude, Cohere,
+//     AI21 on this account). This matches ground truth exactly.
+type bedrockAvailability struct {
+	AgreementAvailability struct {
+		Status string `json:"status"`
+	} `json:"agreementAvailability"`
+	EntitlementAvailability string `json:"entitlementAvailability"`
+	RegionAvailability      string `json:"regionAvailability"`
+}
+
+// availabilityIsCallable reports whether an availability response means the model
+// can actually be invoked on-demand: the access agreement is accepted AND the
+// model is entitled AND available in-region. authorizationStatus is deliberately
+// ignored (it is NOT_AUTHORIZED even for working models).
+func availabilityIsCallable(a bedrockAvailability) bool {
+	return a.AgreementAvailability.Status == "AVAILABLE" &&
+		a.EntitlementAvailability == "AVAILABLE" &&
+		a.RegionAvailability == "AVAILABLE"
 }
 
 // --- pure helpers (unit-tested) --------------------------------------------
@@ -145,6 +182,73 @@ func inferenceProfileIDs(resp bedrockInferenceProfilesResponse) []string {
 		}
 	}
 	return ids
+}
+
+// bedrockProfileBaseModel strips a leading geographic routing prefix from an
+// inference-profile id to recover the underlying foundation-model id, which is the
+// id the availability endpoint understands. Examples:
+//
+//	us.anthropic.claude-sonnet-4-5-20250929-v1:0  -> anthropic.claude-sonnet-4-5-20250929-v1:0
+//	eu.meta.llama3-70b-instruct-v1:0              -> meta.llama3-70b-instruct-v1:0
+//
+// Only known geo prefixes are stripped so a vendor token (e.g. "amazon") is never
+// mistaken for a region.
+func bedrockProfileBaseModel(profileID string) string {
+	i := strings.Index(profileID, ".")
+	if i < 0 {
+		return profileID
+	}
+	switch profileID[:i] {
+	case "us", "eu", "apac", "ap", "us-gov", "global":
+		return profileID[i+1:]
+	}
+	return profileID
+}
+
+// availResult records the outcome of one availability probe. determinate is true
+// only when the control plane returned a clean, parseable 200 response; an error,
+// non-200, or unparseable body leaves determinate=false so the model is treated as
+// "unknown, keep" rather than silently dropped.
+type availResult struct {
+	callable    bool
+	determinate bool
+}
+
+// filterCallableModels applies the availability verdicts to the discovered id sets
+// and returns the deduped, sorted set of callable ids. A model id is EXCLUDED only
+// on a determinate not-callable verdict; any indeterminate id (probe errored / 400
+// / unparseable — keyed by its foundation base) is KEPT. This means a wholesale
+// availability outage (every probe indeterminate) degrades to the full on-demand
+// catalog instead of emptying the pool. Profile ids are keyed by their stripped
+// foundation base. Pure and unit-tested.
+func filterCallableModels(foundation, profiles []string, avail map[string]availResult) []string {
+	keep := func(base string) bool {
+		r, ok := avail[base]
+		if !ok || !r.determinate {
+			return true // unknown -> don't hide
+		}
+		return r.callable
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	for _, f := range foundation {
+		if keep(f) {
+			add(f)
+		}
+	}
+	for _, p := range profiles {
+		if keep(bedrockProfileBaseModel(p)) {
+			add(p)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // --- per-account cache ------------------------------------------------------
@@ -230,15 +334,59 @@ func (h *Handler) signedBedrockControlGet(account *config.Account, path string) 
 	return resp.StatusCode, body, nil
 }
 
-// discoverBedrockModels returns the callable catalog for an account: every ACTIVE
-// text foundation model that is on-demand-invocable as a bare id (all providers)
-// plus every inference-profile id, deduped. Profile-only and provisioned-only bare
-// ids are excluded (they 400 on a bare invoke); profile-only models remain
-// reachable via their inference-profile id. It does NOT probe per-model
-// availability — on this gateway that API is unreliable and would hide usable
-// models. Two control-plane calls (ListFoundationModels + ListInferenceProfiles);
-// the profiles call is best-effort. The result is cached; a list-models error is
-// returned so the caller falls back to static config.
+// bedrockAvailabilityConcurrency bounds the per-model availability fan-out so a
+// large catalog (~120 models) doesn't open one socket per model at once.
+const bedrockAvailabilityConcurrency = 10
+
+// probeBedrockAvailability calls GetFoundationModelAvailability for one foundation
+// model id. It returns callable=true only on a clean 200 whose agreement/entitlement/
+// region are all AVAILABLE. determinate is false for any error, non-200, or
+// unparseable body, signalling "unknown — do not filter this model out".
+func (h *Handler) probeBedrockAvailability(account *config.Account, modelID string) availResult {
+	code, body, err := h.signedBedrockControlGet(account, "/foundation-model-availability/"+modelID)
+	if err != nil || code != http.StatusOK {
+		return availResult{determinate: false}
+	}
+	return availabilityVerdict(body)
+}
+
+// availabilityVerdict parses a GetFoundationModelAvailability body into a verdict.
+// json.Unmarshal succeeds for almost any object, so an empty gate field means the
+// response shape wasn't what we expect (renamed/omitted field, e.g. an AWS-side
+// change). That is treated as INDETERMINATE, not a determinate not-callable verdict
+// — otherwise a shape change would silently empty the whole catalog. Only a
+// response with all three gate fields present yields a trustworthy verdict. Pure
+// and unit-tested.
+func availabilityVerdict(body []byte) availResult {
+	var a bedrockAvailability
+	if json.Unmarshal(body, &a) != nil {
+		return availResult{determinate: false}
+	}
+	if a.AgreementAvailability.Status == "" || a.EntitlementAvailability == "" || a.RegionAvailability == "" {
+		return availResult{determinate: false}
+	}
+	return availResult{callable: availabilityIsCallable(a), determinate: true}
+}
+
+// discoverBedrockModels returns the CALLABLE catalog for an account: ACTIVE
+// text foundation models that are on-demand-invocable as a bare id, plus every
+// inference-profile id, then filtered down to those whose access agreement is
+// accepted (GetFoundationModelAvailability agreement/entitlement/region all
+// AVAILABLE). Models whose agreement is NOT_AVAILABLE (access/use-case form not
+// completed — e.g. Claude, Cohere on a fresh account) are dropped because they
+// cannot actually be invoked, which is the "only callable models" the operator
+// wants.
+//
+// The availability gate is applied per-model and only EXCLUDES on a determinate
+// not-callable verdict; any indeterminate probe (error/400/unparseable) keeps the
+// model. So if the availability API is wholly unreachable (as AWS Service Quotas is
+// on this deployment), discovery degrades to the full on-demand catalog rather than
+// emptying the pool.
+//
+// Cost: ListFoundationModels + ListInferenceProfiles + one availability probe per
+// distinct foundation base (bounded concurrency). Runs on cold cache / explicit
+// refresh only (30-min TTL). A list-models error is returned so the caller falls
+// back to static config.
 func (h *Handler) discoverBedrockModels(account *config.Account) ([]string, error) {
 	code, body, err := h.signedBedrockControlGet(account, "/foundation-models")
 	if err != nil {
@@ -251,37 +399,76 @@ func (h *Handler) discoverBedrockModels(account *config.Account) ([]string, erro
 	if err := json.Unmarshal(body, &list); err != nil {
 		return nil, fmt.Errorf("bedrock discovery: parse list: %w", err)
 	}
-
-	seen := map[string]bool{}
-	all := make([]string, 0, len(list.ModelSummaries))
-	add := func(ids []string) {
-		for _, id := range ids {
-			if id != "" && !seen[id] {
-				seen[id] = true
-				all = append(all, id)
-			}
-		}
-	}
 	foundation := onDemandTextModelIDs(list)
-	add(foundation)
 
 	// Inference profiles are the invocable ids for on-demand cross-region models
 	// (Claude 4.x, etc.). Best-effort: a failure here doesn't sink discovery.
-	profiles := 0
+	var profiles []string
 	if pc, pb, pe := h.signedBedrockControlGet(account, "/inference-profiles"); pe == nil && pc == http.StatusOK {
 		var pr bedrockInferenceProfilesResponse
 		if json.Unmarshal(pb, &pr) == nil {
-			ids := inferenceProfileIDs(pr)
-			profiles = len(ids)
-			add(ids)
+			profiles = inferenceProfileIDs(pr)
 		}
 	}
 
-	sort.Strings(all)
-	setCachedBedrockModelsTTL(account.ID, all, bedrockDiscoveryTTL)
-	logger.Infof("[Bedrock] discovered %d models for account %s (%d on-demand text foundation + %d inference profiles)",
-		len(all), account.ID, len(foundation), profiles)
+	// Availability probe set = every foundation id UNION every profile's stripped
+	// foundation base, deduped (a profile and its bare foundation share one base,
+	// so each base is probed once).
+	bases := map[string]bool{}
+	for _, f := range foundation {
+		bases[f] = true
+	}
+	for _, p := range profiles {
+		bases[bedrockProfileBaseModel(p)] = true
+	}
+	avail := h.probeBedrockAvailabilitySet(account, bases)
+
+	all := filterCallableModels(foundation, profiles, avail)
+
+	determinate, callable := 0, 0
+	for _, r := range avail {
+		if r.determinate {
+			determinate++
+			if r.callable {
+				callable++
+			}
+		}
+	}
+	// An empty callable set is suspect (mass agreement-NOT_AVAILABLE, or a not-yet
+	// diagnosed API quirk); cache it only briefly so recovery is fast rather than
+	// pinned for the full success TTL.
+	ttl := bedrockDiscoveryTTL
+	if len(all) == 0 {
+		ttl = bedrockDiscoveryNegativeTTL
+	}
+	setCachedBedrockModelsTTL(account.ID, all, ttl)
+	logger.Infof("[Bedrock] discovered %d callable models for account %s (%d on-demand text foundation + %d profiles; %d/%d bases determinate-callable)",
+		len(all), account.ID, len(foundation), len(profiles), callable, determinate)
 	return all, nil
+}
+
+// probeBedrockAvailabilitySet probes availability for a set of foundation base ids
+// with bounded concurrency and returns a base->verdict map.
+func (h *Handler) probeBedrockAvailabilitySet(account *config.Account, bases map[string]bool) map[string]availResult {
+	out := make(map[string]availResult, len(bases))
+	var mu sync.Mutex
+	sem := make(chan struct{}, bedrockAvailabilityConcurrency)
+	var wg sync.WaitGroup
+	for base := range bases {
+		base := base
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			r := h.probeBedrockAvailability(account, base)
+			mu.Lock()
+			out[base] = r
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return out
 }
 
 // cachedOrDiscoverBedrockModels returns the cached callable set, refreshing it via

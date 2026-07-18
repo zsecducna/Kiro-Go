@@ -43,6 +43,104 @@ func TestOnDemandTextModelIDs(t *testing.T) {
 	}
 }
 
+func TestAvailabilityIsCallable(t *testing.T) {
+	mk := func(agree, ent, region string) bedrockAvailability {
+		var a bedrockAvailability
+		a.AgreementAvailability.Status = agree
+		a.EntitlementAvailability = ent
+		a.RegionAvailability = region
+		return a
+	}
+	// All three AVAILABLE -> callable (Nova/Llama shape).
+	if !availabilityIsCallable(mk("AVAILABLE", "AVAILABLE", "AVAILABLE")) {
+		t.Error("all-AVAILABLE should be callable")
+	}
+	// Agreement NOT_AVAILABLE -> not callable even though entitlement/region are
+	// AVAILABLE and authorizationStatus is ignored (Claude/Cohere shape).
+	if availabilityIsCallable(mk("NOT_AVAILABLE", "AVAILABLE", "AVAILABLE")) {
+		t.Error("agreement NOT_AVAILABLE must not be callable")
+	}
+	if availabilityIsCallable(mk("AVAILABLE", "NOT_AVAILABLE", "AVAILABLE")) {
+		t.Error("entitlement NOT_AVAILABLE must not be callable")
+	}
+	if availabilityIsCallable(mk("AVAILABLE", "AVAILABLE", "NOT_AVAILABLE")) {
+		t.Error("region NOT_AVAILABLE must not be callable")
+	}
+}
+
+func TestAvailabilityVerdict(t *testing.T) {
+	// Clean all-AVAILABLE 200 -> determinate callable (Nova shape, verified live).
+	if r := availabilityVerdict([]byte(`{"agreementAvailability":{"status":"AVAILABLE"},"authorizationStatus":"NOT_AUTHORIZED","entitlementAvailability":"AVAILABLE","regionAvailability":"AVAILABLE"}`)); !r.determinate || !r.callable {
+		t.Errorf("all-AVAILABLE = %+v, want determinate+callable", r)
+	}
+	// Clean agreement-NOT_AVAILABLE 200 -> determinate not-callable (Claude shape).
+	if r := availabilityVerdict([]byte(`{"agreementAvailability":{"status":"NOT_AVAILABLE"},"authorizationStatus":"NOT_AUTHORIZED","entitlementAvailability":"AVAILABLE","regionAvailability":"AVAILABLE"}`)); !r.determinate || r.callable {
+		t.Errorf("agreement-NOT_AVAILABLE = %+v, want determinate+not-callable", r)
+	}
+	// Shape change (missing regionAvailability) -> INDETERMINATE, so the model is
+	// kept, not silently dropped. This is the catalog-emptying guard.
+	if r := availabilityVerdict([]byte(`{"agreementAvailability":{"status":"AVAILABLE"},"entitlementAvailability":"AVAILABLE"}`)); r.determinate {
+		t.Errorf("missing-field 200 = %+v, want indeterminate", r)
+	}
+	// Garbage body -> indeterminate.
+	if r := availabilityVerdict([]byte(`not json`)); r.determinate {
+		t.Errorf("garbage = %+v, want indeterminate", r)
+	}
+}
+
+func TestBedrockProfileBaseModel(t *testing.T) {
+	cases := map[string]string{
+		"us.anthropic.claude-sonnet-4-5-20250929-v1:0":     "anthropic.claude-sonnet-4-5-20250929-v1:0",
+		"eu.meta.llama3-70b-instruct-v1:0":                 "meta.llama3-70b-instruct-v1:0",
+		"apac.amazon.nova-lite-v1:0":                       "amazon.nova-lite-v1:0",
+		"us-gov.anthropic.claude-3-haiku-v1:0":             "anthropic.claude-3-haiku-v1:0",
+		"global.anthropic.claude-sonnet-4-5-20250929-v1:0": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+		// A bare foundation id (vendor token, not a geo prefix) is unchanged.
+		"amazon.nova-lite-v1:0": "amazon.nova-lite-v1:0",
+		"anthropic.claude-x":    "anthropic.claude-x",
+	}
+	for in, want := range cases {
+		if got := bedrockProfileBaseModel(in); got != want {
+			t.Errorf("base(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFilterCallableModels(t *testing.T) {
+	foundation := []string{
+		"amazon.nova-lite-v1:0",                  // AVAILABLE -> keep
+		"anthropic.claude-3-haiku-20240307-v1:0", // NOT_AVAILABLE -> drop
+		"amazon.titan-text-express-v1",           // indeterminate (400) -> keep
+	}
+	profiles := []string{
+		"us.anthropic.claude-sonnet-4-5-20250929-v1:0", // base NOT_AVAILABLE -> drop
+		"us.meta.llama3-70b-instruct-v1:0",             // base AVAILABLE -> keep
+		"us.mistral.unprobed-v1:0",                     // base absent from map -> keep
+	}
+	avail := map[string]availResult{
+		"amazon.nova-lite-v1:0":                     {callable: true, determinate: true},
+		"anthropic.claude-3-haiku-20240307-v1:0":    {callable: false, determinate: true},
+		"amazon.titan-text-express-v1":              {callable: false, determinate: false},
+		"anthropic.claude-sonnet-4-5-20250929-v1:0": {callable: false, determinate: true},
+		"meta.llama3-70b-instruct-v1:0":             {callable: true, determinate: true},
+	}
+	got := filterCallableModels(foundation, profiles, avail)
+	want := []string{
+		"amazon.nova-lite-v1:0",
+		"amazon.titan-text-express-v1",
+		"us.meta.llama3-70b-instruct-v1:0",
+		"us.mistral.unprobed-v1:0",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
 func TestInferenceProfileIDs(t *testing.T) {
 	raw := []byte(`{"inferenceProfileSummaries":[
 		{"inferenceProfileId":"us.anthropic.claude-sonnet-4-5-20250929-v1:0","status":"ACTIVE"},

@@ -1065,7 +1065,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			}); bErr != nil {
 				lastErr = bErr
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, bErr)
+				// A throttle-cooldown skip is advisory (per-model, short); don't
+				// escalate it into an account-wide failure/cooldown.
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
 				continue
 			}
 			return
@@ -1672,7 +1676,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}); bErr != nil {
 				lastErr = bErr
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, bErr)
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
 				continue
 			}
 			return
@@ -1886,7 +1892,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			}); bErr != nil {
 				lastErr = bErr
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, bErr)
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
 				continue
 			}
 			return
@@ -2321,7 +2329,9 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			}); bErr != nil {
 				lastErr = bErr
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, bErr)
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
 				continue
 			}
 			return

@@ -177,6 +177,12 @@ func (h *Handler) doBedrockInvoke(p forwardParams, anthropicBody []byte, streami
 	if err != nil {
 		return nil, err
 	}
+	// Adaptive throttle: skip a model still in a 429 cooldown so the caller fails
+	// over instead of hammering it. Keyed on the resolved model id so aliases share
+	// one cooldown.
+	if p.account != nil && bedrockThrottle.remaining(p.account.ID, modelID) > 0 {
+		return nil, errBedrockThrottled
+	}
 	creds, err := bedrockCredsFor(p.account)
 	if err != nil {
 		return nil, err
@@ -204,6 +210,16 @@ func (h *Handler) doBedrockInvoke(p forwardParams, anthropicBody []byte, streami
 	resp, err := bedrockHTTPClient(p.account).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("bedrock: request failed: %w", err)
+	}
+	// A 429 arms the per-(account,model) cooldown and surfaces as the throttle
+	// sentinel so the handler fails over WITHOUT triggering the account-wide quota
+	// cooldown (which would bench the account's other models for an hour).
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if p.account != nil {
+			noteBedrockResponseThrottle(p.account.ID, modelID, resp)
+		}
+		resp.Body.Close()
+		return nil, errBedrockThrottled
 	}
 	return resp, nil
 }

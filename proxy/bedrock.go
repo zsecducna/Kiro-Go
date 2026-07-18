@@ -65,10 +65,15 @@ var defaultBedrockModelMap = map[string]string{
 }
 
 // looksLikeBedrockModelID reports whether s is already a Bedrock model or inference
-// profile id (so it should be used verbatim). Bedrock ids contain a provider prefix
-// and a version suffix, e.g. "anthropic.claude-...-v1:0" or "us.anthropic....".
+// profile id (so it should be used verbatim). Concrete ids carry a vendor prefix
+// segment (optionally region-prefixed) and a version suffix with a colon, e.g.
+// "anthropic.claude-...-v2:0", "us.amazon.nova-pro-v1:0",
+// "meta.llama3-70b-instruct-v1:0", "us.deepseek.r1-v1:0". Convenience aliases such
+// as "claude-3-5-sonnet" have neither a "." nor a ":", so this stays specific
+// enough not to swallow them while still matching non-Anthropic ids (needed for
+// the Converse path).
 func looksLikeBedrockModelID(s string) bool {
-	return strings.Contains(s, "anthropic.") && strings.Contains(s, ":")
+	return strings.Contains(s, ":") && strings.Contains(s, ".")
 }
 
 // resolveBedrockModelID turns the client-requested model into a Bedrock model id.
@@ -200,6 +205,10 @@ func (h *Handler) doBedrockInvoke(p forwardParams, anthropicBody []byte, streami
 // partially) streamed, or an error before any client bytes so the caller can fail
 // over to another account.
 func (h *Handler) invokeBedrockStream(w http.ResponseWriter, flusher http.Flusher, p forwardParams) error {
+	// Non-Anthropic models are served via the Converse API instead of native invoke.
+	if accountUsesConverse(p.account) {
+		return h.invokeBedrockConverseAnthropicStream(w, flusher, p)
+	}
 	reqStart := time.Now()
 
 	resp, err := h.doBedrockInvoke(p, p.body, true)
@@ -262,6 +271,10 @@ func (h *Handler) invokeBedrockStream(w http.ResponseWriter, flusher http.Flushe
 // invokeBedrockNonStream performs a non-streaming Bedrock call, writes the JSON
 // response to the client, and bills the customer key.
 func (h *Handler) invokeBedrockNonStream(w http.ResponseWriter, p forwardParams) error {
+	// Non-Anthropic models are served via the Converse API instead of native invoke.
+	if accountUsesConverse(p.account) {
+		return h.invokeBedrockConverseAnthropicNonStream(w, p)
+	}
 	reqStart := time.Now()
 
 	resp, err := h.doBedrockInvoke(p, p.body, false)
@@ -289,7 +302,13 @@ func (h *Handler) invokeBedrockNonStream(w http.ResponseWriter, p forwardParams)
 // request-target so net/http does not re-encode the "%3A" in inference-profile ids.
 // URL.Path is set to the decoded path so SigV4's canonicalizer sees the raw ":".
 func newBedrockRequest(region, modelID string, streaming bool, body []byte) (*http.Request, error) {
-	rawURL := bedrockEndpoint(region, modelID, streaming)
+	return newBedrockRequestForURL(bedrockEndpoint(region, modelID, streaming), body)
+}
+
+// newBedrockRequestForURL builds a POST request to an arbitrary Bedrock URL with
+// the given body. Shared by the invoke and Converse paths so both construct the
+// request identically before SigV4 signing.
+func newBedrockRequestForURL(rawURL string, body []byte) (*http.Request, error) {
 	req, err := http.NewRequest(http.MethodPost, rawURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("bedrock: build request: %w", err)

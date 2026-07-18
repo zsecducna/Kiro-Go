@@ -24,6 +24,7 @@ type adminAddBedrockRequest struct {
 	SecretAccessKey string            `json:"secretAccessKey"`        // IAM secret (required)
 	SessionToken    string            `json:"sessionToken,omitempty"` // Only for STS/temporary credentials
 	ModelMap        map[string]string `json:"modelMap,omitempty"`     // Optional client-model -> Bedrock-model-id overrides
+	UseConverse     bool              `json:"useConverse,omitempty"`  // Use the Converse API (required for non-Anthropic models)
 	Weight          int               `json:"weight,omitempty"`       // Load-balancing weight (0/1 normal)
 	Enabled         *bool             `json:"enabled,omitempty"`      // Route traffic immediately (default true)
 }
@@ -81,6 +82,7 @@ func (h *Handler) addBedrockAccount(req adminAddBedrockRequest) (string, int, er
 		BedrockSecretAccessKey: sk,
 		BedrockSessionToken:    strings.TrimSpace(req.SessionToken),
 		BedrockModelMap:        req.ModelMap,
+		BedrockUseConverse:     req.UseConverse,
 		Tags:                   []string{"Bedrock"},
 		Weight:                 req.Weight,
 		Enabled:                enabled,

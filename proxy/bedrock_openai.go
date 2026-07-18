@@ -707,6 +707,10 @@ func (c *bedrockOpenAIStreamConv) finish(w io.Writer, flusher http.Flusher) {
 // invokeBedrockStream: returns an error before any client bytes (failover), or
 // nil once the response has been at least partially streamed.
 func (h *Handler) invokeBedrockOpenAIStream(w http.ResponseWriter, flusher http.Flusher, p forwardParams) error {
+	// Non-Anthropic models are served via the Converse API instead of native invoke.
+	if accountUsesConverse(p.account) {
+		return h.invokeBedrockConverseOpenAIStream(w, flusher, p)
+	}
 	reqStart := time.Now()
 
 	anthropicBody, err := openAIToAnthropicMessages(p.body)
@@ -747,6 +751,10 @@ func (h *Handler) invokeBedrockOpenAIStream(w http.ResponseWriter, flusher http.
 // Bedrock non-streaming, converts the Anthropic response to an OpenAI
 // chat.completion, and bills the customer key.
 func (h *Handler) invokeBedrockOpenAINonStream(w http.ResponseWriter, p forwardParams) error {
+	// Non-Anthropic models are served via the Converse API instead of native invoke.
+	if accountUsesConverse(p.account) {
+		return h.invokeBedrockConverseOpenAINonStream(w, p)
+	}
 	reqStart := time.Now()
 
 	anthropicBody, err := openAIToAnthropicMessages(p.body)

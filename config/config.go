@@ -82,6 +82,12 @@ type Account struct {
 	BedrockSecretAccessKey string            `json:"bedrockSecretAccessKey,omitempty"`
 	BedrockSessionToken    string            `json:"bedrockSessionToken,omitempty"` // set only for STS/temporary credentials
 	BedrockModelMap        map[string]string `json:"bedrockModelMap,omitempty"`
+	// BedrockUseConverse opts this account into the Bedrock Converse API path
+	// (bedrock-runtime /converse[-stream]) instead of the native Anthropic invoke
+	// path. Required for non-Anthropic models (Nova, Llama, DeepSeek, ...), which do
+	// not accept the Anthropic Messages wire format. Defaults false: Claude models
+	// stay on the zero-translation native invoke path.
+	BedrockUseConverse bool `json:"bedrockUseConverse,omitempty"`
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`

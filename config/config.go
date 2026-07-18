@@ -71,6 +71,18 @@ type Account struct {
 	IssuerURL     string `json:"issuerUrl,omitempty"`     // External IdP OIDC issuer URL
 	Scopes        string `json:"scopes,omitempty"`        // Space-separated scopes granted by the external IdP
 
+	// Native Amazon Bedrock fields. Present only when AuthMethod == "bedrock":
+	// the account calls the Bedrock Runtime invoke endpoints directly with a static
+	// IAM access key, SigV4-signed. Region reuses the existing Region field above.
+	// BedrockModelMap optionally overrides client-model -> Bedrock-model-id resolution
+	// per account; when nil the env BEDROCK_MODEL_MAP and built-in defaults apply.
+	// NOTE: the secret is stored as-is in the config JSON, matching how OAuth tokens
+	// and Kiro API keys are already persisted here; protect the config file at rest.
+	BedrockAccessKeyID     string            `json:"bedrockAccessKeyId,omitempty"`
+	BedrockSecretAccessKey string            `json:"bedrockSecretAccessKey,omitempty"`
+	BedrockSessionToken    string            `json:"bedrockSessionToken,omitempty"` // set only for STS/temporary credentials
+	BedrockModelMap        map[string]string `json:"bedrockModelMap,omitempty"`
+
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
 
@@ -143,6 +155,16 @@ func (a *Account) IsApiKeyCredential() bool {
 // and the failure would wrongly auto-ban a healthy account.
 func (a *Account) IsCustomApi() bool {
 	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "custom_api")
+}
+
+// IsBedrock reports whether the account is a native Amazon Bedrock account:
+// a static IAM access key + region that calls the Bedrock Runtime invoke endpoints
+// directly (SigV4). Like custom_api, such accounts must be excluded from every
+// Kiro/AWS-SSO-facing path (OAuth token refresh, Kiro usage/model probes, ban
+// classifiers) — they have no Kiro credential to refresh and a Kiro API call on
+// their behalf would fail and wrongly ban a healthy account.
+func (a *Account) IsBedrock() bool {
+	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "bedrock")
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.

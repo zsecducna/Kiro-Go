@@ -302,6 +302,9 @@ func (h *Handler) refreshAllAccounts() {
 		}
 		// Custom API accounts have no Kiro token/usage: refresh their quota from the
 		// linked upstream pool's /api/me instead of AWS (which would 403 and auto-ban).
+		if account.IsBedrock() {
+			continue // static IAM creds: no Kiro quota to refresh
+		}
 		if account.IsCustomApi() {
 			quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
 			if err != nil {
@@ -484,6 +487,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleAdminAddCustomApiAccount(w, r)
+	case path == "/admin/add_bedrock_account" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminAddBedrockAccount(w, r)
 
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
@@ -671,6 +679,9 @@ func (h *Handler) refreshModelsCache() {
 		// Custom API accounts load their model list from the linked upstream pool's
 		// /v1/models (not Kiro/AWS): fetch, cache for routing, and aggregate into the
 		// global model list. On failure, skip without banning.
+		if account.IsBedrock() {
+			continue // Bedrock models resolved locally; no upstream probe
+		}
 		if account.IsCustomApi() {
 			models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
 			if err != nil {
@@ -720,6 +731,9 @@ func (h *Handler) refreshModelsCache() {
 func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	// Custom API accounts load their model list from the linked upstream pool's
 	// /v1/models (not Kiro/AWS), then cache it for routing.
+	if account.IsBedrock() {
+		return nil // Bedrock models resolved locally; no upstream probe
+	}
 	if account.IsCustomApi() {
 		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
 		if err != nil {
@@ -1036,6 +1050,22 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				lastErr = fwdErr
 				excluded[account.ID] = true
 				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
+		}
+		// Native Bedrock accounts call the Bedrock Runtime invoke endpoint directly
+		// and re-emit the native Anthropic events. Like custom_api this is a
+		// transparent passthrough that ends the request on success; a pre-stream
+		// failure falls over to the next account.
+		if account.IsBedrock() {
+			if bErr := h.invokeBedrockStream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, bErr)
 				continue
 			}
 			return
@@ -1634,6 +1664,19 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 			return
 		}
+		// Native Bedrock non-streaming invoke (see streaming counterpart above).
+		if account.IsBedrock() {
+			if bErr := h.invokeBedrockNonStream(w, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, bErr)
+				continue
+			}
+			return
+		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var content string
@@ -1833,6 +1876,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if account.IsBedrock() {
+			// Bedrock is not wired for the OpenAI wire format yet; skip so it
+			// is not mis-served by the Kiro translation path.
+			excluded[account.ID] = true
+			continue
+		}
 		if account.IsCustomApi() {
 			// Already forwarded once: don't add another hop, and don't penalize this
 			// healthy account (loop-guard is not a failure) — just skip it. The account
@@ -2253,6 +2302,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if account.IsBedrock() {
+			// Bedrock is not wired for the OpenAI wire format yet; skip so it
+			// is not mis-served by the Kiro translation path.
+			excluded[account.ID] = true
+			continue
+		}
 		if account.IsCustomApi() {
 			// Already forwarded once: don't add another hop, and don't penalize this
 			// healthy account (loop-guard is not a failure) — just skip it. The account
@@ -2358,6 +2413,11 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 	// Custom API accounts carry a static upstream bearer (KiroApiKey); there is no
 	// OAuth token to refresh and no expiry to honor.
 	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
+		return nil
+	}
+	// Bedrock accounts authenticate each request with a static IAM access key via
+	// SigV4; there is no OAuth token to refresh and no expiry to honor.
+	if account.IsBedrock() {
 		return nil
 	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
@@ -4112,6 +4172,10 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 
 	// Custom API accounts have no Kiro credential to exercise; test them by sending a
 	// real minimal chat request THROUGH the linked upstream pool and returning its reply.
+	if account.IsBedrock() {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Bedrock account; credentials are validated on first live request"})
+		return
+	}
 	if account.IsCustomApi() {
 		var tReq struct {
 			Model string `json:"model"`
@@ -4198,6 +4262,10 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 	// Custom API accounts have no Kiro token/usage to refresh. "Refresh" for them means
 	// re-validating the upstream key against its /api/me quota and reloading the model
 	// list from the upstream /v1/models — never a Kiro/AWS call.
+	if account.IsBedrock() {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Bedrock account; nothing to refresh"})
+		return
+	}
 	if account.IsCustomApi() {
 		quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
 		if err != nil {
@@ -4399,6 +4467,19 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 
 	// Custom API accounts serve whatever the linked pool serves: load the model list
 	// from the upstream provider's /v1/models, not from Kiro/AWS.
+	if account.IsBedrock() {
+		ids := make([]string, 0)
+		for _, v := range account.BedrockModelMap {
+			ids = append(ids, v)
+		}
+		if len(ids) == 0 {
+			for _, v := range defaultBedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"models": ids})
+		return
+	}
 	if account.IsCustomApi() {
 		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
 		if err != nil {

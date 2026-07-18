@@ -166,6 +166,69 @@ func bedrockEndpoint(region, modelID string, streaming bool) string {
 	return fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/%s", region, modelID, verb)
 }
 
+// bedrockTestReply runs a minimal non-streaming Bedrock call for the admin
+// account-test panel and returns the assistant's reply text. It uses the Converse
+// path for converse accounts and native invoke otherwise, so the test exercises
+// the same code path a real request would.
+func (h *Handler) bedrockTestReply(account *config.Account, model string) (string, error) {
+	p := forwardParams{account: account, model: model}
+	anthropicBody := []byte(`{"anthropic_version":"` + bedrockAnthropicVersion + `","max_tokens":16,"messages":[{"role":"user","content":"Reply with exactly: OK"}]}`)
+
+	var resp *http.Response
+	var err error
+	if accountUsesConverse(account) {
+		conv, cerr := anthropicToConverseBody(anthropicBody)
+		if cerr != nil {
+			return "", cerr
+		}
+		resp, err = h.doBedrockConverseInvoke(p, conv, false)
+	} else {
+		resp, err = h.doBedrockInvoke(p, anthropicBody, false)
+	}
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	// Both paths yield an Anthropic Messages response (Converse is converted); pull
+	// the text out for display.
+	anthropicJSON := respBody
+	if accountUsesConverse(account) {
+		converted, _, _, cerr := converseResponseToAnthropicMessage(respBody, model)
+		if cerr != nil {
+			return "", cerr
+		}
+		anthropicJSON = converted
+	}
+	return extractAnthropicReplyText(anthropicJSON), nil
+}
+
+// extractAnthropicReplyText joins the text blocks of an Anthropic Messages
+// response body.
+func extractAnthropicReplyText(body []byte) string {
+	var m struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if json.Unmarshal(body, &m) != nil {
+		return ""
+	}
+	var parts []string
+	for _, c := range m.Content {
+		if c.Type == "text" && c.Text != "" {
+			parts = append(parts, c.Text)
+		}
+	}
+	return strings.Join(parts, "")
+}
+
 // doBedrockInvoke builds, signs, and sends a Bedrock invoke request for an
 // already-Anthropic-format body. It centralizes model resolution, credential
 // lookup, body rewrite, SigV4 signing, and the per-account HTTP client so the

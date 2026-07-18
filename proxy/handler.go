@@ -4221,7 +4221,17 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 	// Custom API accounts have no Kiro credential to exercise; test them by sending a
 	// real minimal chat request THROUGH the linked upstream pool and returning its reply.
 	if account.IsBedrock() {
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Bedrock account; credentials are validated on first live request"})
+		var tReq struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&tReq)
+		reply, err := h.bedrockTestReply(account, tReq.Model)
+		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "reply": reply})
 		return
 	}
 	if account.IsCustomApi() {
@@ -4530,7 +4540,14 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 				ids = append(ids, v)
 			}
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{"models": ids})
+		// The panel expects {success, models:[{modelId}]} (same shape as custom_api),
+		// not a bare string array.
+		models := make([]map[string]interface{}, 0, len(ids))
+		for _, id := range ids {
+			models = append(models, map[string]interface{}{"modelId": id})
+		}
+		h.pool.SetModelList(account.ID, ids)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models})
 		return
 	}
 	if account.IsCustomApi() {

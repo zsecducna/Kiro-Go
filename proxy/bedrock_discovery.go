@@ -2,21 +2,25 @@ package proxy
 
 // Bedrock model auto-discovery.
 //
-// ListFoundationModels lifecycle status ("ACTIVE") does NOT mean a key can call a
-// model: on-demand invoke also requires the account to be authorized/entitled for
-// it. The authoritative callability signal is the control-plane
-// GetFoundationModelAvailability response field authorizationStatus == "AUTHORIZED"
-// (agreement + region also AVAILABLE). This was confirmed live: a listed ACTIVE
-// model with authorizationStatus NOT_AUTHORIZED returns HTTP 400 "Operation not
-// allowed" on invoke.
+// A model is only listed if it is actually callable on-demand. Two signals drive
+// this, and they are NOT the same:
 //
-// Discovery therefore = ListFoundationModels (candidates) then
-// GetFoundationModelAvailability per candidate, keeping only AUTHORIZED text
-// models. Results are cached per account so the hot path (resolveBedrockModelID)
-// and apiGetAccountModels read the cache, never the network. All calls reuse the
-// same hand-rolled SigV4 signer against the bedrock (control-plane) host.
+//   - inferenceTypesSupported (from ListFoundationModels): trusted. A bare
+//     foundation id is invocable on-demand only when this contains "ON_DEMAND".
+//     INFERENCE_PROFILE-only and PROVISIONED-only ids 400 on a bare invoke, so
+//     they are excluded here — the INFERENCE_PROFILE ones come back via their
+//     us./eu. inference-profile id from ListInferenceProfiles instead.
+//   - GetFoundationModelAvailability authorizationStatus: NOT trusted. This
+//     gateway reports NOT_AUTHORIZED even for models that invoke fine, so probing
+//     it would hide usable models. It is deliberately not called.
 //
-// NOTE: authorizationStatus is the binary "callable" gate. Per-model throughput
+// Discovery therefore = ListFoundationModels (kept: ON_DEMAND text) UNION
+// ListInferenceProfiles (the callable cross-region ids), deduped. Results are
+// cached per account so the hot path (resolveBedrockModelID) and apiGetAccountModels
+// read the cache, never the network. All calls reuse the same hand-rolled SigV4
+// signer against the bedrock (control-plane) host.
+//
+// NOTE: ON_DEMAND is the static "callable as a bare id" gate. Per-model throughput
 // limits (RPM/TPM) are a separate concern surfaced at invoke time as HTTP 429;
 // exposing them would require the Service Quotas API and is a future follow-up.
 
@@ -76,25 +80,52 @@ type bedrockInferenceProfilesResponse struct {
 
 // --- pure helpers (unit-tested) --------------------------------------------
 
-// activeTextModelIDs returns the ids of ALL ACTIVE, text-output foundation models
-// from a ListFoundationModels response (every provider: Anthropic, Amazon Nova,
-// Meta Llama, DeepSeek, Mistral, Qwen, ...). It intentionally does NOT filter by
-// inference type or availability: on this gateway the availability API is
-// unreliable (it reports NOT_AUTHORIZED for models that invoke fine), so filtering
-// would hide usable models. Callers pair this with the inference-profile ids to
-// present the full callable catalog.
-func activeTextModelIDs(resp bedrockListModelsResponse) []string {
+// onDemandTextModelIDs returns the ids of ACTIVE, text-output foundation models
+// that are callable on-demand via their BARE foundation id — i.e. those whose
+// inferenceTypesSupported includes "ON_DEMAND".
+//
+// Two deliberate exclusions (both "listed but unusable" as a bare id):
+//   - INFERENCE_PROFILE-only models: the bare foundation id returns HTTP 400
+//     "on-demand throughput isn't supported, use an inference profile" on invoke.
+//     The callable us./eu. profile id for these is added separately by the caller
+//     from ListInferenceProfiles, so the model is still reachable — just not under
+//     its bare id.
+//   - PROVISIONED-only models: not invocable on-demand at all.
+//
+// This filter reads inferenceTypesSupported, which is static metadata from
+// ListFoundationModels itself — NOT the GetFoundationModelAvailability probe, which
+// this gateway reports unreliably (NOT_AUTHORIZED for models that invoke fine). A
+// model with an empty/absent inferenceTypesSupported is kept (unknown, don't hide).
+func onDemandTextModelIDs(resp bedrockListModelsResponse) []string {
 	var ids []string
 	for _, m := range resp.ModelSummaries {
 		if m.ModelLifecycle.Status != "ACTIVE" {
 			continue
 		}
+		isText := false
 		for _, o := range m.OutputModalities {
 			if o == "TEXT" {
-				ids = append(ids, m.ModelID)
+				isText = true
 				break
 			}
 		}
+		if !isText {
+			continue
+		}
+		// Keep only bare ids callable on-demand. Empty list = unknown, keep.
+		if len(m.InferenceTypesSupported) > 0 {
+			onDemand := false
+			for _, t := range m.InferenceTypesSupported {
+				if t == "ON_DEMAND" {
+					onDemand = true
+					break
+				}
+			}
+			if !onDemand {
+				continue
+			}
+		}
+		ids = append(ids, m.ModelID)
 	}
 	return ids
 }
@@ -199,13 +230,15 @@ func (h *Handler) signedBedrockControlGet(account *config.Account, path string) 
 	return resp.StatusCode, body, nil
 }
 
-// discoverBedrockModels returns the full callable catalog for an account: every
-// ACTIVE text foundation model (all providers) plus every inference-profile id,
-// deduped. It does NOT probe per-model availability — on this gateway that API is
-// unreliable and would hide usable models. Two control-plane calls
-// (ListFoundationModels + ListInferenceProfiles); the profiles call is best-effort.
-// The result is cached; a list-models error is returned so the caller falls back
-// to static config.
+// discoverBedrockModels returns the callable catalog for an account: every ACTIVE
+// text foundation model that is on-demand-invocable as a bare id (all providers)
+// plus every inference-profile id, deduped. Profile-only and provisioned-only bare
+// ids are excluded (they 400 on a bare invoke); profile-only models remain
+// reachable via their inference-profile id. It does NOT probe per-model
+// availability — on this gateway that API is unreliable and would hide usable
+// models. Two control-plane calls (ListFoundationModels + ListInferenceProfiles);
+// the profiles call is best-effort. The result is cached; a list-models error is
+// returned so the caller falls back to static config.
 func (h *Handler) discoverBedrockModels(account *config.Account) ([]string, error) {
 	code, body, err := h.signedBedrockControlGet(account, "/foundation-models")
 	if err != nil {
@@ -229,7 +262,8 @@ func (h *Handler) discoverBedrockModels(account *config.Account) ([]string, erro
 			}
 		}
 	}
-	add(activeTextModelIDs(list))
+	foundation := onDemandTextModelIDs(list)
+	add(foundation)
 
 	// Inference profiles are the invocable ids for on-demand cross-region models
 	// (Claude 4.x, etc.). Best-effort: a failure here doesn't sink discovery.
@@ -245,8 +279,8 @@ func (h *Handler) discoverBedrockModels(account *config.Account) ([]string, erro
 
 	sort.Strings(all)
 	setCachedBedrockModelsTTL(account.ID, all, bedrockDiscoveryTTL)
-	logger.Infof("[Bedrock] discovered %d models for account %s (%d foundation active-text + %d inference profiles)",
-		len(all), account.ID, len(activeTextModelIDs(list)), profiles)
+	logger.Infof("[Bedrock] discovered %d models for account %s (%d on-demand text foundation + %d inference profiles)",
+		len(all), account.ID, len(foundation), profiles)
 	return all, nil
 }
 

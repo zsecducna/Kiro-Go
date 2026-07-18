@@ -8,33 +8,37 @@ import (
 	"kiro-go/config"
 )
 
-func TestActiveTextModelIDs(t *testing.T) {
+func TestOnDemandTextModelIDs(t *testing.T) {
 	// Shapes taken from a real ListFoundationModels response.
 	raw := []byte(`{"modelSummaries":[
 		{"modelId":"anthropic.claude-haiku-4-5-20251001-v1:0","providerName":"Anthropic","outputModalities":["TEXT"],"inferenceTypesSupported":["ON_DEMAND"],"modelLifecycle":{"status":"ACTIVE"}},
 		{"modelId":"anthropic.claude-3-sonnet-20240229-v1:0","providerName":"Anthropic","outputModalities":["TEXT"],"inferenceTypesSupported":["ON_DEMAND"],"modelLifecycle":{"status":"LEGACY"}},
 		{"modelId":"amazon.titan-image-generator-v1","providerName":"Amazon","outputModalities":["IMAGE"],"inferenceTypesSupported":["ON_DEMAND"],"modelLifecycle":{"status":"ACTIVE"}},
 		{"modelId":"anthropic.claude-sonnet-4-5-20250929-v1:0","providerName":"Anthropic","outputModalities":["TEXT"],"inferenceTypesSupported":["INFERENCE_PROFILE"],"modelLifecycle":{"status":"ACTIVE"}},
+		{"modelId":"amazon.provisioned-only-v1:0","providerName":"Amazon","outputModalities":["TEXT"],"inferenceTypesSupported":["PROVISIONED"],"modelLifecycle":{"status":"ACTIVE"}},
+		{"modelId":"amazon.unknown-inference-v1:0","providerName":"Amazon","outputModalities":["TEXT"],"modelLifecycle":{"status":"ACTIVE"}},
 		{"modelId":"meta.llama3-8b-instruct-v1:0","providerName":"Meta","outputModalities":["TEXT"],"inferenceTypesSupported":["ON_DEMAND"],"modelLifecycle":{"status":"ACTIVE"}}
 	]}`)
 	var r bedrockListModelsResponse
 	if err := json.Unmarshal(raw, &r); err != nil {
 		t.Fatal(err)
 	}
-	got := activeTextModelIDs(r)
-	// ALL active text models, regardless of inference type (the INFERENCE_PROFILE-
-	// only Sonnet is now included; only LEGACY and non-text are excluded).
+	got := onDemandTextModelIDs(r)
+	// Only bare ids callable on-demand survive: the two ON_DEMAND text models plus
+	// the one with an absent inferenceTypesSupported (unknown -> kept). Excluded:
+	// LEGACY, IMAGE, INFERENCE_PROFILE-only (covered by its us. profile id instead),
+	// and PROVISIONED-only.
 	want := map[string]bool{
-		"anthropic.claude-haiku-4-5-20251001-v1:0":  true,
-		"anthropic.claude-sonnet-4-5-20250929-v1:0": true,
-		"meta.llama3-8b-instruct-v1:0":              true,
+		"anthropic.claude-haiku-4-5-20251001-v1:0": true,
+		"meta.llama3-8b-instruct-v1:0":             true,
+		"amazon.unknown-inference-v1:0":            true,
 	}
 	if len(got) != 3 {
-		t.Fatalf("got %v, want 3 ACTIVE text models (all inference types)", got)
+		t.Fatalf("got %v, want 3 on-demand-callable text models", got)
 	}
 	for _, id := range got {
 		if !want[id] {
-			t.Errorf("unexpected id %q (legacy/non-text should be excluded)", id)
+			t.Errorf("unexpected id %q (legacy/non-text/profile-only/provisioned-only should be excluded)", id)
 		}
 	}
 }

@@ -42,9 +42,6 @@ const bedrockDiscoveryTTL = 30 * time.Minute
 // transient control-plane error recovers quickly rather than being pinned.
 const bedrockDiscoveryNegativeTTL = 2 * time.Minute
 
-// bedrockDiscoveryMaxConcurrency caps parallel availability probes per discovery.
-const bedrockDiscoveryMaxConcurrency = 8
-
 // bedrockControlPlaneTimeout bounds a single control-plane request so a hung
 // endpoint cannot pin an HTTP handler for the invoke client's long timeout.
 const bedrockControlPlaneTimeout = 20 * time.Second
@@ -70,54 +67,53 @@ type bedrockListModelsResponse struct {
 	ModelSummaries []bedrockFoundationModelSummary `json:"modelSummaries"`
 }
 
-type bedrockAvailabilityResponse struct {
-	AuthorizationStatus   string `json:"authorizationStatus"`
-	AgreementAvailability struct {
-		Status string `json:"status"`
-	} `json:"agreementAvailability"`
-	EntitlementAvailability string `json:"entitlementAvailability"`
-	RegionAvailability      string `json:"regionAvailability"`
+type bedrockInferenceProfilesResponse struct {
+	InferenceProfileSummaries []struct {
+		InferenceProfileID string `json:"inferenceProfileId"`
+		Status             string `json:"status"`
+	} `json:"inferenceProfileSummaries"`
 }
 
 // --- pure helpers (unit-tested) --------------------------------------------
 
-// activeTextModelIDs returns the ids of ACTIVE, text-output, ON_DEMAND-invocable
-// models from a ListFoundationModels response — the candidate set for availability
-// probing. ON_DEMAND is required because discovery resolves aliases to these bare
-// foundation ids; a model that only supports INFERENCE_PROFILE would 400 on invoke
-// of the bare id, so it is excluded (the static default map's us.* inference
-// profile still handles such aliases).
+// activeTextModelIDs returns the ids of ALL ACTIVE, text-output foundation models
+// from a ListFoundationModels response (every provider: Anthropic, Amazon Nova,
+// Meta Llama, DeepSeek, Mistral, Qwen, ...). It intentionally does NOT filter by
+// inference type or availability: on this gateway the availability API is
+// unreliable (it reports NOT_AUTHORIZED for models that invoke fine), so filtering
+// would hide usable models. Callers pair this with the inference-profile ids to
+// present the full callable catalog.
 func activeTextModelIDs(resp bedrockListModelsResponse) []string {
 	var ids []string
 	for _, m := range resp.ModelSummaries {
 		if m.ModelLifecycle.Status != "ACTIVE" {
 			continue
 		}
-		text := false
 		for _, o := range m.OutputModalities {
 			if o == "TEXT" {
-				text = true
+				ids = append(ids, m.ModelID)
+				break
 			}
-		}
-		onDemand := false
-		for _, it := range m.InferenceTypesSupported {
-			if it == "ON_DEMAND" {
-				onDemand = true
-			}
-		}
-		if text && onDemand {
-			ids = append(ids, m.ModelID)
 		}
 	}
 	return ids
 }
 
-// availabilityIsCallable reports whether an availability response means the model
-// is actually invocable by this account.
-func availabilityIsCallable(a bedrockAvailabilityResponse) bool {
-	return a.AuthorizationStatus == "AUTHORIZED" &&
-		a.RegionAvailability == "AVAILABLE" &&
-		a.AgreementAvailability.Status == "AVAILABLE"
+// inferenceProfileIDs returns the invocable inference-profile ids (e.g.
+// us.anthropic.claude-..., us.amazon.nova-...) from a ListInferenceProfiles
+// response — these are the ids that work for on-demand cross-region invoke of
+// models that don't support a bare foundation-id call.
+func inferenceProfileIDs(resp bedrockInferenceProfilesResponse) []string {
+	var ids []string
+	for _, p := range resp.InferenceProfileSummaries {
+		if p.Status != "" && p.Status != "ACTIVE" {
+			continue
+		}
+		if p.InferenceProfileID != "" {
+			ids = append(ids, p.InferenceProfileID)
+		}
+	}
+	return ids
 }
 
 // --- per-account cache ------------------------------------------------------
@@ -203,11 +199,14 @@ func (h *Handler) signedBedrockControlGet(account *config.Account, path string) 
 	return resp.StatusCode, body, nil
 }
 
-// discoverBedrockCallableModels lists foundation models and returns the ids that
-// are actually callable by this account (authorizationStatus AUTHORIZED). The
-// result is cached; on any control-plane error the caller falls back to static
-// config so discovery never hard-fails a request.
-func (h *Handler) discoverBedrockCallableModels(account *config.Account) ([]string, error) {
+// discoverBedrockModels returns the full callable catalog for an account: every
+// ACTIVE text foundation model (all providers) plus every inference-profile id,
+// deduped. It does NOT probe per-model availability — on this gateway that API is
+// unreliable and would hide usable models. Two control-plane calls
+// (ListFoundationModels + ListInferenceProfiles); the profiles call is best-effort.
+// The result is cached; a list-models error is returned so the caller falls back
+// to static config.
+func (h *Handler) discoverBedrockModels(account *config.Account) ([]string, error) {
 	code, body, err := h.signedBedrockControlGet(account, "/foundation-models")
 	if err != nil {
 		return nil, err
@@ -219,49 +218,36 @@ func (h *Handler) discoverBedrockCallableModels(account *config.Account) ([]stri
 	if err := json.Unmarshal(body, &list); err != nil {
 		return nil, fmt.Errorf("bedrock discovery: parse list: %w", err)
 	}
-	candidates := activeTextModelIDs(list)
 
-	// Probe availability concurrently; keep only callable models.
-	callable := make([]string, 0, len(candidates))
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	var probeErrors int
-	sem := make(chan struct{}, bedrockDiscoveryMaxConcurrency)
-	for _, id := range candidates {
-		wg.Add(1)
-		go func(id string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			c, b, e := h.signedBedrockControlGet(account, "/foundation-model-availability/"+id)
-			if e != nil || c != http.StatusOK {
-				mu.Lock()
-				probeErrors++
-				mu.Unlock()
-				return
+	seen := map[string]bool{}
+	all := make([]string, 0, len(list.ModelSummaries))
+	add := func(ids []string) {
+		for _, id := range ids {
+			if id != "" && !seen[id] {
+				seen[id] = true
+				all = append(all, id)
 			}
-			var a bedrockAvailabilityResponse
-			if json.Unmarshal(b, &a) == nil && availabilityIsCallable(a) {
-				mu.Lock()
-				callable = append(callable, id)
-				mu.Unlock()
-			}
-		}(id)
+		}
 	}
-	wg.Wait()
+	add(activeTextModelIDs(list))
 
-	sort.Strings(callable)
-	// If a large fraction of probes errored, the set is likely under-reported —
-	// cache it only briefly so the next call retries instead of pinning a partial
-	// result for the full success TTL.
-	ttl := bedrockDiscoveryTTL
-	if len(candidates) > 0 && probeErrors*2 > len(candidates) {
-		ttl = bedrockDiscoveryNegativeTTL
+	// Inference profiles are the invocable ids for on-demand cross-region models
+	// (Claude 4.x, etc.). Best-effort: a failure here doesn't sink discovery.
+	profiles := 0
+	if pc, pb, pe := h.signedBedrockControlGet(account, "/inference-profiles"); pe == nil && pc == http.StatusOK {
+		var pr bedrockInferenceProfilesResponse
+		if json.Unmarshal(pb, &pr) == nil {
+			ids := inferenceProfileIDs(pr)
+			profiles = len(ids)
+			add(ids)
+		}
 	}
-	setCachedBedrockModelsTTL(account.ID, callable, ttl)
-	logger.Infof("[Bedrock] discovered %d callable models for account %s (of %d active text candidates, %d probe errors)",
-		len(callable), account.ID, len(candidates), probeErrors)
-	return callable, nil
+
+	sort.Strings(all)
+	setCachedBedrockModelsTTL(account.ID, all, bedrockDiscoveryTTL)
+	logger.Infof("[Bedrock] discovered %d models for account %s (%d foundation active-text + %d inference profiles)",
+		len(all), account.ID, len(activeTextModelIDs(list)), profiles)
+	return all, nil
 }
 
 // cachedOrDiscoverBedrockModels returns the cached callable set, refreshing it via
@@ -280,7 +266,7 @@ func (h *Handler) cachedOrDiscoverBedrockModels(account *config.Account) []strin
 	if m, ok := getCachedBedrockModels(account.ID); ok {
 		return m
 	}
-	m, err := h.discoverBedrockCallableModels(account)
+	m, err := h.discoverBedrockModels(account)
 	if err != nil {
 		// Negative-cache the failure briefly so a key lacking
 		// bedrock:ListFoundationModels doesn't pay a round-trip on every call.

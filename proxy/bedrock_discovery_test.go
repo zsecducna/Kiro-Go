@@ -22,12 +22,15 @@ func TestActiveTextModelIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := activeTextModelIDs(r)
+	// ALL active text models, regardless of inference type (the INFERENCE_PROFILE-
+	// only Sonnet is now included; only LEGACY and non-text are excluded).
 	want := map[string]bool{
-		"anthropic.claude-haiku-4-5-20251001-v1:0": true,
-		"meta.llama3-8b-instruct-v1:0":             true,
+		"anthropic.claude-haiku-4-5-20251001-v1:0":  true,
+		"anthropic.claude-sonnet-4-5-20250929-v1:0": true,
+		"meta.llama3-8b-instruct-v1:0":              true,
 	}
-	if len(got) != 2 {
-		t.Fatalf("got %v, want the 2 ACTIVE text models", got)
+	if len(got) != 3 {
+		t.Fatalf("got %v, want 3 ACTIVE text models (all inference types)", got)
 	}
 	for _, id := range got {
 		if !want[id] {
@@ -36,17 +39,22 @@ func TestActiveTextModelIDs(t *testing.T) {
 	}
 }
 
-func TestAvailabilityIsCallable(t *testing.T) {
-	callable := bedrockAvailabilityResponse{AuthorizationStatus: "AUTHORIZED", RegionAvailability: "AVAILABLE"}
-	callable.AgreementAvailability.Status = "AVAILABLE"
-	if !availabilityIsCallable(callable) {
-		t.Error("AUTHORIZED + AVAILABLE + AVAILABLE should be callable")
+func TestInferenceProfileIDs(t *testing.T) {
+	raw := []byte(`{"inferenceProfileSummaries":[
+		{"inferenceProfileId":"us.anthropic.claude-sonnet-4-5-20250929-v1:0","status":"ACTIVE"},
+		{"inferenceProfileId":"us.amazon.nova-lite-v1:0"},
+		{"inferenceProfileId":"eu.retired-model","status":"INACTIVE"}
+	]}`)
+	var r bedrockInferenceProfilesResponse
+	if err := json.Unmarshal(raw, &r); err != nil {
+		t.Fatal(err)
 	}
-	// Real response for a listed-but-uncallable model.
-	notAuth := bedrockAvailabilityResponse{AuthorizationStatus: "NOT_AUTHORIZED", RegionAvailability: "AVAILABLE"}
-	notAuth.AgreementAvailability.Status = "AVAILABLE"
-	if availabilityIsCallable(notAuth) {
-		t.Error("NOT_AUTHORIZED must not be callable even when region/entitlement available")
+	got := inferenceProfileIDs(r)
+	if len(got) != 2 {
+		t.Fatalf("got %v, want 2 (INACTIVE excluded, missing-status included)", got)
+	}
+	if got[0] != "us.anthropic.claude-sonnet-4-5-20250929-v1:0" || got[1] != "us.amazon.nova-lite-v1:0" {
+		t.Errorf("profile ids = %v", got)
 	}
 }
 

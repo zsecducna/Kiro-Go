@@ -1275,7 +1275,17 @@
         '<div class="detail-section"><h4>Extra Regions</h4><div class="machine-id-row">' +
         '<input type="text" id="regionsInput" value="' + escapeAttr((a.bedrockRegions || []).join(', ')) + '" placeholder="eu-west-1, us-west-2" />' +
         '<button class="btn btn-sm btn-primary" data-detail-action="saveRegions" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
-        '</div><p class="help-block">Comma-separated fallback regions. On "Operation not allowed" the server tries these (primary first) and learns which region each model is callable in. Refresh Models prewarms the map.</p></div>'
+        '</div><p class="help-block">Comma-separated fallback regions. On "Operation not allowed" the server tries these (primary first) and learns which region each model is callable in. Refresh Models prewarms the map.</p></div>' +
+        '<div class="detail-section"><h4>Credentials</h4>' +
+        '<p class="help-block">Current: ' + (a.bedrockApiKey ? 'Bedrock API key (bearer)' : (a.bedrockAccessKeyId ? 'IAM access key' : 'none')) + '. Fill a field to replace it; blank fields are left unchanged. Saving clears the model + region cache.</p>' +
+        '<div class="form-group"><label>Bedrock API Key <span class="muted-text">(bearer token, ABSK…)</span></label>' +
+        '<input type="password" id="bedrockApiKeyInput" class="font-mono" placeholder="ABSK..." /></div>' +
+        '<div class="form-group"><label>Access Key ID</label>' +
+        '<input type="text" id="bedrockAkInput" class="font-mono" placeholder="AKIA..." /></div>' +
+        '<div class="form-group"><label>Secret Access Key</label>' +
+        '<input type="password" id="bedrockSkInput" class="font-mono" placeholder="secret" /></div>' +
+        '<button class="btn btn-sm btn-primary" data-detail-action="saveBedrockCreds" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+        '</div>'
         : '') +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.weight')) + '</h4>' +
@@ -1486,6 +1496,17 @@
   async function saveRegions(id) {
     const regions = $('regionsInput').value.split(',').map(s => s.trim()).filter(Boolean);
     await putAccount(id, { bedrockRegions: regions }, 'Extra regions saved');
+  }
+  async function saveBedrockCreds(id) {
+    const apiKey = $('bedrockApiKeyInput').value.trim();
+    const ak = $('bedrockAkInput').value.trim();
+    const sk = $('bedrockSkInput').value.trim();
+    const body = {};
+    if (apiKey) body.bedrockApiKey = apiKey;
+    if (ak) body.bedrockAccessKeyId = ak;
+    if (sk) body.bedrockSecretAccessKey = sk;
+    if (Object.keys(body).length === 0) { toast('Fill a credential field to update', 'warning'); return; }
+    await putAccount(id, body, 'Credentials saved');
   }
   function closeDetailModal() { closeDialog('detailModal'); }
 
@@ -3390,6 +3411,7 @@
       else if (a === 'saveProxyURL') saveProxyURL(id);
       else if (a === 'saveRegion') saveRegion(id);
       else if (a === 'saveRegions') saveRegions(id);
+      else if (a === 'saveBedrockCreds') saveBedrockCreds(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
     });

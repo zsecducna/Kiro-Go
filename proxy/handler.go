@@ -4282,6 +4282,11 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 			Model string `json:"model"`
 		}
 		json.NewDecoder(r.Body).Decode(&tReq)
+		// An explicit test must reflect LIVE state, not a cached verdict: drop the
+		// learned region routes so the test re-sweeps every candidate region. Bedrock
+		// per-region access can flap, so a stale "not callable anywhere" negative-cache
+		// entry would otherwise mask a region whose access just reopened.
+		clearBedrockRegionRoutes(account.ID)
 		reply, err := h.bedrockTestReply(account, tReq.Model)
 		if err != nil {
 			w.WriteHeader(502)

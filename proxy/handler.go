@@ -732,7 +732,22 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	// Custom API accounts load their model list from the linked upstream pool's
 	// /v1/models (not Kiro/AWS), then cache it for routing.
 	if account.IsBedrock() {
-		return nil // Bedrock models resolved locally; no upstream probe
+		// Bedrock has no Kiro/AWS /v1/models endpoint: resolve the callable model
+		// list via control-plane discovery (falling back to the account/default
+		// map) and cache it so the panel's cached-models view and routing work.
+		ids := h.cachedOrDiscoverBedrockModels(account)
+		if len(ids) == 0 {
+			for _, v := range account.BedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		if len(ids) == 0 {
+			for _, v := range defaultBedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		h.pool.SetModelList(account.ID, ids)
+		return nil
 	}
 	if account.IsCustomApi() {
 		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
@@ -791,6 +806,10 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 		account.RefreshToken = latest.RefreshToken
 		account.ExpiresAt = latest.ExpiresAt
 		account.ProfileArn = latest.ProfileArn
+	}
+	// An explicit refresh should re-run Bedrock discovery, not reuse the cache.
+	if account.IsBedrock() {
+		clearBedrockModelCache(account.ID)
 	}
 	if err := h.fetchAndCacheAccountModels(account); err != nil {
 		w.WriteHeader(500)

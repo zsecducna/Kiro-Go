@@ -148,6 +148,14 @@ func setCachedBedrockModels(accountID string, models []string) {
 	setCachedBedrockModelsTTL(accountID, models, bedrockDiscoveryTTL)
 }
 
+// clearBedrockModelCache drops any cached discovery for an account so the next
+// lookup re-discovers. Used by the explicit "refresh models" admin action.
+func clearBedrockModelCache(accountID string) {
+	bedrockDiscoveryMu.Lock()
+	delete(bedrockDiscoveryCache, accountID)
+	bedrockDiscoveryMu.Unlock()
+}
+
 // setCachedBedrockModelsTTL stores a COPY of models with an explicit TTL (a short
 // TTL is used for negative results so a transient control-plane failure recovers
 // quickly instead of being pinned for the full success TTL).

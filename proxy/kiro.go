@@ -10,6 +10,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -356,6 +357,25 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 	}
 
+	err := callKiroEndpointsOnce(account, payload, callback)
+	// A Kiro API-key (ksk_) key is region-bound: a request sent to the wrong
+	// data-plane region is rejected as an invalid bearer token (HTTP 403) even though
+	// the key is valid elsewhere. On that auth failure, re-detect the key's region and,
+	// if a different region accepts it, retry once there. Auth errors are raised before
+	// any streaming callback fires (the status check precedes parseAndStream), so the
+	// single retry cannot double-emit output to the client.
+	if err != nil && account.IsApiKeyCredential() && pool.IsAuthFailure(err) {
+		if _, ok := reprobeApiKeyRegion(account); ok {
+			err = callKiroEndpointsOnce(account, payload, callback)
+		}
+	}
+	return err
+}
+
+// callKiroEndpointsOnce performs a single pass over the configured Kiro endpoints for
+// the account's currently-resolved region, returning on the first success or on a
+// terminal (401/403/402) error. CallKiroAPI wraps it with api_key region-failover.
+func callKiroEndpointsOnce(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	// Build endpoint list ordered by configuration.
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 

@@ -13,6 +13,11 @@ type ResponsesRequest struct {
 	Store              *bool             `json:"store,omitempty"`
 	Temperature        *float64          `json:"temperature,omitempty"`
 	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty"`
+  // OpenAI Responses API reasoning shape.
+	Reasoning *ResponsesReasoningConfig `json:"reasoning,omitempty"`
+	// Optional compatibility shapes.
+	Thinking     *ClaudeThinkingConfig `json:"thinking,omitempty"`
+	OutputConfig *ClaudeOutputConfig   `json:"output_config,omitempty"`
 	Metadata           map[string]string `json:"metadata,omitempty"`
 }
 
@@ -59,4 +64,8 @@ type ResponsesError struct {
 	Type    string `json:"type"`
 	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
+}
+
+type ResponsesReasoningConfig struct {
+	Effort string `json:"effort,omitempty"`
 }

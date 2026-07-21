@@ -861,4 +861,5 @@ type ModelInfo struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
+  AdditionalModelRequestFieldsSchema json.RawMessage `json:"additionalModelRequestFieldsSchema,omitempty"`
 }

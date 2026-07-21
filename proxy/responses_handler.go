@@ -91,10 +91,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	}
 
 	openaiReq := &OpenAIRequest{
-		Model:    req.Model,
-		Messages: finalMessages,
-		Stream:   req.Stream,
-		Tools:    req.Tools,
+		Model:        req.Model,
+		Messages:     finalMessages,
+		Stream:       req.Stream,
+		Tools:        req.Tools,
+    Thinking:     req.Thinking,
+	  OutputConfig: req.OutputConfig,
 	}
 	if req.Temperature != nil {
 		openaiReq.Temperature = *req.Temperature
@@ -102,13 +104,45 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	if req.MaxOutputTokens != nil {
 		openaiReq.MaxTokens = *req.MaxOutputTokens
 	}
+  if req.Reasoning != nil {
+  	openaiReq.Reasoning = &OpenAIReasoningConfig{
+  		Effort: req.Reasoning.Effort,
+  	}
+  }
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	openaiReq.Model = actualModel
+	actualModel, suffixThinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix,)
 
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+  openaiReq.Model = actualModel
+  
+  capability := h.reasoningCapabilityForModel(actualModel)
+  
+  additionalFields, nativeRequested, buildErr :=
+  	BuildOpenAIAdditionalModelRequestFields(
+  		openaiReq,
+  		capability,
+  	)
+  if buildErr != nil {
+  	h.sendOpenAIError(
+  		w,
+  		400,
+  		"invalid_request_error",
+  		buildErr.Error(),
+  	)
+  	return
+  }
+  
+  thinking := suffixThinking || nativeRequested
+  
+  useLegacyThinkingPrompt :=
+  	thinking && len(additionalFields) == 0
+  
+  estimatedInputTokens :=
+  	estimateOpenAIRequestInputTokens(openaiReq)
+  
+  kiroPayload := OpenAIToKiro(openaiReq, useLegacyThinkingPrompt,)
+  
+  kiroPayload.AdditionalModelRequestFields = additionalFields
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()

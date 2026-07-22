@@ -112,6 +112,17 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `KIRO_DIAGNOSTICS` | Enables stream, payload, and reasoning diagnostics | `false` |
+| `KIRO_DIAG_STREAM` | Logs aggregate stream metrics | `false` |
+| `KIRO_DIAG_PAYLOAD` | Logs payload size and truncation metrics | `false` |
+| `KIRO_DIAG_REASONING` | Logs reasoning capabilities and forwarded fields | `false` |
+| `KIRO_DIAG_CHUNKS` | Logs raw and normalized stream chunks; may contain sensitive content | `false` |
+
+Diagnostic logging is disabled by default.
+
+Accepted enabled values: `1`, `true`, `yes`, `on`, `enabled`.
+
+`KIRO_DIAGNOSTICS` does not enable `KIRO_DIAG_CHUNKS`.
 
 ## Contributing
 

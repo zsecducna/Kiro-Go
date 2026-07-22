@@ -268,12 +268,8 @@ func BuildClaudeAdditionalModelRequestFields(
 	intent := reasoningIntent{}
 
 	if req.Thinking != nil {
-		intent.ThinkingType = strings.ToLower(
-			strings.TrimSpace(req.Thinking.Type),
-		)
-		intent.Display = strings.ToLower(
-			strings.TrimSpace(req.Thinking.Display),
-		)
+		intent.ThinkingType = normalizeClaudeThinkingType(req.Thinking.Type, capability.ThinkingTypes)
+		intent.Display = strings.ToLower(strings.TrimSpace(req.Thinking.Display))
 		intent.BudgetTokens = req.Thinking.BudgetTokens
 
 		switch intent.ThinkingType {
@@ -337,7 +333,20 @@ func BuildOpenAIAdditionalModelRequestFields(
 	if strings.TrimSpace(intent.Effort) == "" {
 		intent.Effort = req.ReasoningEffort
 	}
-	if strings.TrimSpace(intent.Effort) != "" {
+
+	effort := canonicalEffort(intent.Effort)
+	switch effort {
+	case "":
+		// Client did not request an effort level.
+
+	case "none":
+		// OpenAI's "none" means reasoning should be disabled.
+		intent.Disabled = true
+		intent.Enabled = false
+		intent.Effort = ""
+
+	default:
+		intent.Effort = effort
 		intent.Enabled = true
 	}
 
@@ -359,6 +368,20 @@ func buildAdditionalModelRequestFields(
 				"thinking is disabled but reasoning effort was also provided",
 			)
 		}
+
+		if capability.SupportsThinking {
+			if disabledType, ok := matchThinkingType(
+				"disabled",
+				capability.ThinkingTypes,
+			); ok {
+				return map[string]interface{}{
+					"thinking": map[string]interface{}{
+						"type": disabledType,
+					},
+				}, true, nil
+			}
+		}
+
 		return nil, false, nil
 	}
 
@@ -520,6 +543,62 @@ func selectThinkingType(requested string, supported []string) (string, bool) {
 	}
 
 	return "", false
+}
+
+func matchThinkingType(
+	requested string,
+	supported []string,
+) (string, bool) {
+	requested = strings.TrimSpace(requested)
+
+	for _, value := range supported {
+		if strings.EqualFold(
+			strings.TrimSpace(value),
+			requested,
+		) {
+			return value, true
+		}
+	}
+
+	return "", false
+}
+
+func normalizeClaudeThinkingType(
+	requested string,
+	supported []string,
+) string {
+	requested = strings.ToLower(
+		strings.TrimSpace(requested),
+	)
+
+	switch requested {
+	case "enabled":
+		// Keep enabled when the model natively supports it.
+		if value, ok := matchThinkingType(
+			"enabled",
+			supported,
+		); ok {
+			return value
+		}
+
+		// Claude Code's enabled maps to Kiro adaptive thinking.
+		if value, ok := matchThinkingType(
+			"adaptive",
+			supported,
+		); ok {
+			return value
+		}
+
+	case "none":
+		if value, ok := matchThinkingType(
+			"disabled",
+			supported,
+		); ok {
+			return value
+		}
+	}
+
+	return requested
 }
 
 func matchSupportedEffort(

@@ -293,8 +293,15 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 提取系统提示
 	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	toolSteeringInjected := len(req.Tools) > 0 && !claudeToolChoiceIsNone(req.ToolChoice)
+
+	if diagnostics.Reasoning() {
+		logger.Infof(
+			"[ToolSteering] tools=%d toolChoice=%v injected=%t", len(req.Tools), req.ToolChoice, toolSteeringInjected)
+	}
+
 	// Reinforce tool execution for active agent turns.
-	if len(req.Tools) > 0 && !claudeToolChoiceIsNone(req.ToolChoice) {
+	if toolSteeringInjected {
 		if systemPrompt != "" {
 			systemPrompt += "\n\n"
 		}

@@ -897,9 +897,7 @@ func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {
 }
 
 // Read reasoning capabilities from the cached model schema.
-func (h *Handler) reasoningCapabilityForModel(
-	modelID string,
-) ModelReasoningCapability {
+func (h *Handler) reasoningCapabilityForModel(modelID string) ModelReasoningCapability {
 	normalizedID := strings.ToLower(
 		strings.TrimSpace(MapModel(modelID)),
 	)
@@ -925,8 +923,7 @@ func (h *Handler) reasoningCapabilityForModel(
 		}
 		capability := ParseModelReasoningCapability(model)
 
-		if diagnostics.Reasoning() &&
-			capability.SchemaParseError != "" {
+		if diagnostics.Reasoning() && capability.SchemaParseError != "" {
 			logger.Warnf(
 				"[KiroReasoning] model=%s schema parse failed: %s",
 				modelID,
@@ -991,37 +988,20 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinkingRequested :=
-		resolveClaudeThinkingMode(
-			req.Model,
-			req.Thinking,
-			thinkingCfg.Suffix,
-		)
-
+	actualModel, thinkingRequested := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
 
 	capability := h.reasoningCapabilityForModel(actualModel)
 
-	additionalFields, nativeRequested, buildErr :=
-		BuildClaudeAdditionalModelRequestFields(
-			&req,
-			capability,
-		)
+	additionalFields, nativeRequested, buildErr := BuildClaudeAdditionalModelRequestFields(&req, capability)
 	if buildErr != nil {
-		h.sendClaudeError(
-			w,
-			400,
-			"invalid_request_error",
-			buildErr.Error(),
-		)
+		h.sendClaudeError(w, 400, "invalid_request_error", buildErr.Error())
 		return
 	}
 
 	thinkingRequested = thinkingRequested || nativeRequested
 
-	useLegacyThinkingPrompt :=
-		thinkingRequested &&
-			len(additionalFields) == 0
+	useLegacyThinkingPrompt := thinkingRequested && len(additionalFields) == 0
 
 	effectiveReq := cloneClaudeRequestForThinking(&req, useLegacyThinkingPrompt)
 
@@ -1061,9 +1041,7 @@ func claudeReasoningEffort(req *ClaudeRequest) string {
 	}
 
 	if req.OutputConfig != nil {
-		if effort := strings.TrimSpace(
-			req.OutputConfig.Effort,
-		); effort != "" {
+		if effort := strings.TrimSpace(req.OutputConfig.Effort); effort != "" {
 			return effort
 		}
 	}
@@ -1103,18 +1081,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	capability := h.reasoningCapabilityForModel(actualModel)
 
 	// Build only reasoning fields supported by this model.
-	additionalFields, nativeRequested, buildErr :=
-		BuildClaudeAdditionalModelRequestFields(
-			&req,
-			capability,
-		)
+	additionalFields, nativeRequested, buildErr := BuildClaudeAdditionalModelRequestFields(&req, capability)
 	if buildErr != nil {
-		h.sendClaudeError(
-			w,
-			400,
-			"invalid_request_error",
-			buildErr.Error(),
-		)
+		h.sendClaudeError(w, 400, "invalid_request_error", buildErr.Error())
 		return
 	}
 
@@ -1143,35 +1112,19 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		)
 	}
 
-	useLegacyThinkingPrompt :=
-		thinking && len(additionalFields) == 0
+	useLegacyThinkingPrompt := thinking && len(additionalFields) == 0
 
-	effectiveReq := cloneClaudeRequestForThinking(
-		&req,
-		useLegacyThinkingPrompt,
-	)
+	effectiveReq := cloneClaudeRequestForThinking(&req, useLegacyThinkingPrompt)
 
-	thinkingResponseOpts :=
-		resolveClaudeThinkingResponseOptions(
-			req.Thinking,
-			thinkingCfg.ClaudeFormat,
-		)
+	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 
-	estimatedInputTokens :=
-		estimateClaudeRequestInputTokens(effectiveReq)
+	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 
-	cacheProfile := h.promptCache.BuildClaudeProfile(
-		effectiveReq,
-		estimatedInputTokens,
-	)
+	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
-	kiroPayload := ClaudeToKiro(
-		&req,
-		useLegacyThinkingPrompt,
-	)
+	kiroPayload := ClaudeToKiro(&req, useLegacyThinkingPrompt)
 
-	kiroPayload.AdditionalModelRequestFields =
-		additionalFields
+	kiroPayload.AdditionalModelRequestFields = additionalFields
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -2056,28 +2009,15 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 
-	actualModel, suffixThinking :=
-		ParseModelAndThinking(
-			req.Model,
-			thinkingCfg.Suffix,
-		)
+	actualModel, suffixThinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 
 	req.Model = actualModel
 
 	capability := h.reasoningCapabilityForModel(actualModel)
 
-	additionalFields, nativeRequested, buildErr :=
-		BuildOpenAIAdditionalModelRequestFields(
-			&req,
-			capability,
-		)
+	additionalFields, nativeRequested, buildErr := BuildOpenAIAdditionalModelRequestFields(&req, capability)
 	if buildErr != nil {
-		h.sendOpenAIError(
-			w,
-			400,
-			"invalid_request_error",
-			buildErr.Error(),
-		)
+		h.sendOpenAIError(w, 400, "invalid_request_error", buildErr.Error())
 		return
 	}
 
@@ -2087,10 +2027,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
-	kiroPayload := OpenAIToKiro(
-		&req,
-		useLegacyThinkingPrompt,
-	)
+	kiroPayload := OpenAIToKiro(&req, useLegacyThinkingPrompt)
 
 	kiroPayload.AdditionalModelRequestFields = additionalFields
 

@@ -438,11 +438,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		// callback (OnText/OnToolUse/parseEventStream) still returns the upstream
 		// TCP connection to the transport pool instead of leaking it.
 		if err := parseAndStream(resp.Body, callback); err != nil {
-			logger.Warnf(
-				"[KiroAPI] Endpoint %s stream failed: %v",
-				ep.Name,
-				err,
-			)
+			logger.Warnf("[KiroAPI] Endpoint %s stream failed: %v", ep.Name, err)
 			return err
 		}
 

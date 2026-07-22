@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"kiro-go/diagnostics"
+	"kiro-go/logger"
 	"regexp"
 	"strings"
 	"time"
@@ -42,6 +44,22 @@ var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
+
+const agentToolExecutionPrompt = `You are operating as the model backend for an autonomous coding agent.
+
+When the current request requires reading files, searching code, editing or creating files, running commands, tests, or validation, invoke the appropriate provided tool immediately.
+
+Reasoning, planning, or describing a tool action does not count as executing it.
+Do not merely announce, describe, promise, or plan the next action.
+Do not end the turn while required tool actions or verification remain.
+Continue using tools until the requested work is complete.
+Only then provide a concise final summary.`
+
+// Remind the model to execute pending tool work.
+const agentToolTurnReminder = `[Agent execution requirement]
+If this request requires a tool, invoke the appropriate tool now.
+Thinking about, describing, or announcing the tool action is not sufficient.
+Continue until the requested action and verification are complete.`
 
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
@@ -162,6 +180,20 @@ func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
 	return kind == "enabled" || kind == "adaptive"
 }
 
+func claudeToolChoiceIsNone(choice interface{}) bool {
+	switch value := choice.(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "none")
+
+	case map[string]interface{}:
+		kind, _ := value["type"].(string)
+		return strings.EqualFold(strings.TrimSpace(kind), "none")
+
+	default:
+		return false
+	}
+}
+
 func MapModel(model string) string {
 	mapped, _ := ParseModelAndThinking(model, "-thinking")
 	return mapped
@@ -178,8 +210,17 @@ type ClaudeRequest struct {
 	Stream      bool                  `json:"stream,omitempty"`
 	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
-	Tools       []ClaudeTool          `json:"tools,omitempty"`
-	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	// Anthropic Messages API native effort shape.
+	OutputConfig *ClaudeOutputConfig `json:"output_config,omitempty"`
+	// Compatibility for clients that send OpenAI-style top-level effort
+	// even though they call /v1/messages.
+	ReasoningEffort string       `json:"reasoning_effort,omitempty"`
+	Tools           []ClaudeTool `json:"tools,omitempty"`
+	ToolChoice      interface{}  `json:"tool_choice,omitempty"`
+}
+
+type ClaudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
@@ -252,6 +293,21 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 提取系统提示
 	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	toolSteeringInjected := len(req.Tools) > 0 && !claudeToolChoiceIsNone(req.ToolChoice)
+
+	if diagnostics.Reasoning() {
+		logger.Infof(
+			"[ToolSteering] tools=%d toolChoice=%v injected=%t", len(req.Tools), req.ToolChoice, toolSteeringInjected)
+	}
+
+	// Reinforce tool execution for active agent turns.
+	if toolSteeringInjected {
+		if systemPrompt != "" {
+			systemPrompt += "\n\n"
+		}
+
+		systemPrompt += agentToolExecutionPrompt
+	}
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -357,6 +413,21 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		if continuation := buildToolResultsContinuation(currentToolResults); continuation != finalContent {
 			finalContent = finalContent + "\n\n" + continuation
 		}
+	}
+
+	// Reinforce tool execution on fresh user turns.
+	//
+	// Do not add this to tool-result continuations because those already belong
+	// to an active tool loop.
+	if len(req.Tools) > 0 &&
+		len(currentToolResults) == 0 &&
+		!claudeToolChoiceIsNone(req.ToolChoice) {
+
+		if finalContent != "" {
+			finalContent += "\n\n"
+		}
+
+		finalContent += agentToolTurnReminder
 	}
 
 	// 转换工具
@@ -1046,6 +1117,15 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+	// Common compatibility shapes.
+	Thinking        *ClaudeThinkingConfig  `json:"thinking,omitempty"`
+	OutputConfig    *ClaudeOutputConfig    `json:"output_config,omitempty"`
+	Reasoning       *OpenAIReasoningConfig `json:"reasoning,omitempty"`
+	ReasoningEffort string                 `json:"reasoning_effort,omitempty"`
+}
+
+type OpenAIReasoningConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1705,8 +1785,45 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 		return
 	}
 
-	tokenLimit := maxPayloadTokens(currentMessageModelID(payload))
+	modelID := currentMessageModelID(payload)
+	tokenLimit := maxPayloadTokens(modelID)
+
+	// Measure payload changes without altering truncation logic.
+	var beforeBytes int
+	var beforeTokens int
+	var beforeHistory int
+	var beforeCurrentChars int
+	var beforeToolCount int
+	var beforeToolResultCount int
+
+	if diagnostics.Payload() {
+		beforeBytes = payloadByteSize(payload)
+		beforeTokens = estimateKiroPayloadTokens(payload)
+		beforeHistory = len(payload.ConversationState.History)
+		beforeCurrentChars = len([]rune(payload.ConversationState.CurrentMessage.UserInputMessage.Content))
+
+		ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+
+		if ctx != nil {
+			beforeToolCount = len(ctx.Tools)
+			beforeToolResultCount = len(ctx.ToolResults)
+		}
+	}
+
 	if payloadFits(payload, tokenLimit) {
+		if diagnostics.Payload() {
+			logger.Infof(
+				"[Payload] model=%s bytes=%d tokens=%d/%d history=%d tools=%d toolResults=%d currentChars=%d truncated=false",
+				modelID,
+				beforeBytes,
+				beforeTokens,
+				tokenLimit,
+				beforeHistory,
+				beforeToolCount,
+				beforeToolResultCount,
+				beforeCurrentChars,
+			)
+		}
 		return
 	}
 
@@ -1840,6 +1957,43 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 
 	// Safety net: any path that broke the pairing must not reach the wire.
 	detachOrphanedToolResults(payload)
+
+	if diagnostics.Payload() {
+		afterBytes := payloadByteSize(payload)
+		afterTokens := estimateKiroPayloadTokens(payload)
+		afterHistory := len(payload.ConversationState.History)
+		afterCurrentChars := len([]rune(payload.ConversationState.CurrentMessage.UserInputMessage.Content))
+
+		afterToolCount := 0
+		afterToolResultCount := 0
+
+		afterCtx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+
+		if afterCtx != nil {
+			afterToolCount = len(afterCtx.Tools)
+			afterToolResultCount = len(
+				afterCtx.ToolResults,
+			)
+		}
+
+		logger.Infof(
+			"[Payload] model=%s bytes=%d->%d tokens=%d->%d/%d history=%d->%d tools=%d->%d toolResults=%d->%d currentChars=%d->%d truncated=true",
+			modelID,
+			beforeBytes,
+			afterBytes,
+			beforeTokens,
+			afterTokens,
+			tokenLimit,
+			beforeHistory,
+			afterHistory,
+			beforeToolCount,
+			afterToolCount,
+			beforeToolResultCount,
+			afterToolResultCount,
+			beforeCurrentChars,
+			afterCurrentChars,
+		)
+	}
 }
 
 // activeToolTurn returns the assistant turn whose structured toolUses are

@@ -145,7 +145,9 @@ func shouldProbeFallbackRegions(account *config.Account) bool {
 	if strings.TrimSpace(account.Region) == "" {
 		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp")
+	// IDC and external IdP login regions may differ from the Kiro profile region.
+	method := strings.ToLower(strings.TrimSpace(account.AuthMethod))
+	return method == "external_idp" || method == "idc"
 }
 
 // GetUsageLimits 获取账户使用量和订阅信息
@@ -860,4 +862,6 @@ type ModelInfo struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
+	// Model-specific request schema returned by Kiro.
+	AdditionalModelRequestFieldsSchema json.RawMessage `json:"additionalModelRequestFieldsSchema,omitempty"`
 }

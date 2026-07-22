@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/config"
+	"kiro-go/diagnostics"
 	"kiro-go/logger"
 	"net/http"
 	"net/url"
@@ -55,6 +56,9 @@ var kiroEndpoints = []kiroEndpoint{
 var kiroHttpStore atomic.Pointer[http.Client]
 var kiroRestHttpStore atomic.Pointer[http.Client]
 
+// Allow long-running agent streams to finish.
+const kiroStreamingTimeout = 15 * time.Minute
+
 // proxyClientCache caches http.Client instances keyed by proxy URL for per-account proxy support.
 var proxyClientCache sync.Map
 
@@ -72,7 +76,7 @@ func GetClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		Timeout:   kiroStreamingTimeout,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -130,7 +134,7 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		Timeout:   kiroStreamingTimeout,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
@@ -158,6 +162,10 @@ type KiroPayload struct {
 	} `json:"conversationState"`
 	ProfileArn      string           `json:"profileArn,omitempty"`
 	InferenceConfig *InferenceConfig `json:"inferenceConfig,omitempty"`
+
+	// Native model-specific request configuration discovered from
+	// ListAvailableModels.additionalModelRequestFieldsSchema.
+	AdditionalModelRequestFields map[string]interface{} `json:"additionalModelRequestFields,omitempty"`
 
 	// ToolNameMap maps sanitized tool names (sent to Kiro) back to the
 	// original names supplied by the client. Used to restore original names
@@ -367,6 +375,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
 		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
 
+		// Log reasoning fields without exposing the full payload.
+		if diagnostics.Reasoning() && len(payload.AdditionalModelRequestFields) > 0 {
+			logger.Infof("[KiroOutboundReasoning] endpoint=%s fields=%s", ep.Name, reasoningFieldsJSON(
+				payload.AdditionalModelRequestFields),
+			)
+		}
+
 		reqBody, _ := json.Marshal(payload)
 		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
 		if err != nil {
@@ -422,7 +437,12 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		// parseAndStream defers resp.Body.Close(), so a panic in a streaming
 		// callback (OnText/OnToolUse/parseEventStream) still returns the upstream
 		// TCP connection to the transport pool instead of leaking it.
-		return parseAndStream(resp.Body, callback)
+		if err := parseAndStream(resp.Body, callback); err != nil {
+			logger.Warnf("[KiroAPI] Endpoint %s stream failed: %v", ep.Name, err)
+			return err
+		}
+
+		return nil
 	}
 
 	if lastErr != nil {
@@ -455,6 +475,17 @@ const maxEventStreamMessageBytes = 16 * 1024 * 1024
 // allocating gigabytes.
 var errEventStreamFrameTooLarge = errors.New("event-stream: frame totalLength exceeds maximum")
 
+func diagnosticPreview(value string) string {
+	const maxRunes = 512
+
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+
+	return string(runes[:maxRunes]) + "…[truncated]"
+}
+
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	if callback == nil {
@@ -467,12 +498,35 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	var eventCount int
+	var assistantEventCount int
+	var reasoningEventCount int
+	var toolEventCount int
+	var lastEventType string
+	var assistantChars int
+	var reasoningChars int
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
 		_, err := io.ReadFull(body, prelude)
 		if err == io.EOF {
+			// Collect stream metrics only when diagnostics are enabled.
+			if diagnostics.Stream() {
+				logger.Infof(
+					"[KiroStream] EOF events=%d last=%q assistantEvents=%d reasoningEvents=%d reasoningChars=%d toolEvents=%d assistantChars=%d inputTokens=%d outputTokens=%d credits=%.3f",
+					eventCount,
+					lastEventType,
+					assistantEventCount,
+					reasoningEventCount,
+					reasoningChars,
+					toolEventCount,
+					assistantChars,
+					inputTokens,
+					outputTokens,
+					totalCredits,
+				)
+			}
 			break
 		}
 		if err != nil {
@@ -509,6 +563,12 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		}
 
 		eventType := extractEventType(msgBuf[0:headersLength])
+		// Collect stream metrics only when diagnostics are enabled.
+		if diagnostics.Stream() {
+			eventCount++
+			lastEventType = eventType
+		}
+
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
 		if len(payloadBytes) == 0 {
 			continue
@@ -524,31 +584,86 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		// Dispatch by event type.
 		switch eventType {
 		case "assistantResponseEvent":
+			// if diagnostics.Stream() {
+			// 	assistantEventCount++
+			// }
+
 			if content, ok := event["content"].(string); ok && content != "" {
+
+				previous := lastAssistantContent
+
 				normalized := normalizeChunk(content, &lastAssistantContent)
+
+				if diagnostics.Stream() && normalized != "" {
+					assistantEventCount++
+					assistantChars += len([]rune(normalized))
+				}
+
+				if diagnostics.Chunks() {
+					logger.Infof(
+						"[StreamChunk] type=assistant previous=%q raw=%q normalized=%q",
+						diagnosticPreview(previous),
+						diagnosticPreview(content),
+						diagnosticPreview(normalized),
+					)
+				}
+
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, false)
 				}
 			}
+
 		case "reasoningContentEvent":
+			// if diagnostics.Stream() {
+			// 	reasoningEventCount++
+			// }
+
 			if text, ok := event["text"].(string); ok && text != "" {
+				previous := lastReasoningContent
 				normalized := normalizeChunk(text, &lastReasoningContent)
+
+				if diagnostics.Stream() && normalized != "" {
+					reasoningEventCount++
+					reasoningChars += len([]rune(normalized))
+				}
+
+				if diagnostics.Chunks() {
+					logger.Infof(
+						"[StreamChunk] type=reasoning previous=%q raw=%q normalized=%q",
+						diagnosticPreview(previous),
+						diagnosticPreview(text),
+						diagnosticPreview(normalized),
+					)
+				}
+
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, true)
 				}
 			}
+
 		case "toolUseEvent":
+			if diagnostics.Stream() {
+				toolEventCount++
+			}
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
+
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
+
 		case "contextUsageEvent":
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				if callback.OnContextUsage != nil {
 					callback.OnContextUsage(pct)
 				}
 			}
+
+		default:
+			logger.Debugf(
+				"[KiroStream] unhandled event type=%q",
+				eventType,
+			)
 		}
 	}
 

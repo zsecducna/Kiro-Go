@@ -362,6 +362,22 @@
               </div>
             </div>
           </div>
+          <div class="form-group">
+            <label data-i18n="settings.proxyPool"></label>
+            <textarea id="proxyPool" rows="4"
+              placeholder="socks5://user:pass@host:port&#10;http://host:port"></textarea>
+            <p class="help-block" data-i18n="settings.proxyPoolHint"></p>
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.proxyRotateMinutes"></label>
+            <div class="input-row">
+              <input type="number" id="proxyRotateMinutes" class="w-24!" min="1" placeholder="10" />
+              <span class="help-block m-0">
+                <span data-i18n="settings.proxyActive"></span>:
+                <span id="proxyActive" class="font-mono">—</span>
+              </span>
+            </div>
+          </div>
           <button class="btn btn-primary" id="saveProxyBtn" data-i18n="settings.saveProxy"></button>
         </div>
 

@@ -145,8 +145,9 @@ func shouldProbeFallbackRegions(account *config.Account) bool {
 	if strings.TrimSpace(account.Region) == "" {
 		return true
 	}
+	// IDC and external IdP login regions may differ from the Kiro profile region.
 	method := strings.ToLower(strings.TrimSpace(account.AuthMethod))
-  return method == "external_idp" || method == "idc"
+	return method == "external_idp" || method == "idc"
 }
 
 // GetUsageLimits 获取账户使用量和订阅信息
@@ -689,7 +690,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		// api_key account: it must never write config (classifyAndBanOnUsageError
 		// would call UpdateAccount with the throwaway's empty ID). Guard BEFORE the
 		// classify/ban helper so both the suspension and auth-fail branches are skipped.
-		if account.IsApiKeyCredential() {
+		if account.IsApiKeyCredential() || account.IsCustomApi() {
 			return nil, fmt.Errorf("GetUsageLimits: %w", err)
 		}
 		return nil, classifyAndBanOnUsageError(account, err)
@@ -861,5 +862,6 @@ type ModelInfo struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
-  AdditionalModelRequestFieldsSchema json.RawMessage `json:"additionalModelRequestFieldsSchema,omitempty"`
+	// Model-specific request schema returned by Kiro.
+	AdditionalModelRequestFieldsSchema json.RawMessage `json:"additionalModelRequestFieldsSchema,omitempty"`
 }

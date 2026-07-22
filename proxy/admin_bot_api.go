@@ -4,10 +4,12 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	"os"
 	"strings"
@@ -23,6 +25,7 @@ import (
 //	POST /admin/stats            — per-key usage stats, optionally filtered
 //	GET  /admin/pool             — pool credit accounting (available vs sold)
 //	POST /admin/add_kiro_api_key — add a Kiro API key (ksk_) account to the pool
+//	POST /admin/add_kiro_account — add an OAuth (social/idc/external_idp) account to the pool
 //
 // The admin key is read from "Authorization: Bearer <key>" or the
 // "X-Admin-Password" header. Deliberately NO cookie fallback: these are
@@ -186,8 +189,8 @@ func (h *Handler) handleAdminDeleteApiKey(w http.ResponseWriter, r *http.Request
 // and supply the amount to ADD to its limits. Credits and/or Tokens; at least
 // one must be > 0. Amounts are additive top-ups, never absolute limits.
 type adminRechargeApiKeyRequest struct {
-	ID      string  `json:"id,omitempty"`     // Key entry UUID
-	ApiKey  string  `json:"apiKey,omitempty"` // Full cleartext key value (sk-...)
+	ID      string  `json:"id,omitempty"`      // Key entry UUID
+	ApiKey  string  `json:"apiKey,omitempty"`  // Full cleartext key value (sk-...)
 	Credits float64 `json:"credits,omitempty"` // Credits to ADD to the key's credit limit
 	Tokens  int64   `json:"tokens,omitempty"`  // Optional tokens to ADD to the token limit
 }
@@ -375,6 +378,12 @@ func (h *Handler) handleAdminBotStats(w http.ResponseWriter, r *http.Request) {
 // account's UsageCurrent and the key's CreditsUsed by the same credits, so both
 // terms shrink together and sellableCredits only moves when accounts are
 // added/reset or keys are sold/expired.
+// isBannedStatus reports whether a BanStatus means "upstream rejected this
+// account", as opposed to "DISABLED" — an operator/quota decision.
+func isBannedStatus(status string) bool {
+	return strings.EqualFold(status, "BANNED") || strings.EqualFold(status, "SUSPENDED")
+}
+
 func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
@@ -390,7 +399,7 @@ func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 	for _, acc := range accounts {
 		// Skip unusable rows BEFORE claiming the identity slot, so a dead row
 		// encountered first doesn't shadow a healthy same-account row behind it.
-		if !acc.Enabled || strings.EqualFold(acc.BanStatus, "BANNED") || strings.EqualFold(acc.BanStatus, "SUSPENDED") {
+		if !acc.Enabled || isBannedStatus(acc.BanStatus) {
 			continue
 		}
 		dedupeKey := strings.TrimSpace(acc.UserId)
@@ -408,6 +417,77 @@ func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 			accountsAvailable += rem
 		}
 	}
+
+	// --- Account census. The pool itself only ever holds ENABLED, routable rows
+	// (Reload -> GetEnabledAccounts, minus quota-blocked), and banning an account
+	// disables it — so a banned account is invisible to every field above, and
+	// `accounts.total` counts only what's enabled, not what's owned. Census the
+	// FULL config so the operator can see dead stock and real inventory.
+	//
+	// Deduped on the underlying Kiro identity (same key as the credit maths), so
+	// one account with several region rows counts once. When those rows disagree
+	// the BEST state wins — an identity still serving from one region is active,
+	// whatever a sibling row says.
+	poolResident := make(map[string]bool, len(accounts))
+	for _, acc := range accounts {
+		poolResident[acc.ID] = true
+	}
+	degraded := make(map[string]bool)
+	for _, s := range h.pool.HealthSnapshots() {
+		if s.CooldownActive || s.Circuit != "closed" {
+			degraded[s.ID] = true
+		}
+	}
+	// Lower rank = healthier; used to collapse an identity's rows to one state.
+	const (
+		stActive = iota
+		stCooldown
+		stDisabled
+		stBanned
+	)
+	bestState := make(map[string]int)
+	for _, a := range config.GetAccounts() {
+		key := strings.TrimSpace(a.UserId)
+		if key == "" {
+			key = a.ID
+		}
+		st := stActive
+		switch {
+		case isBannedStatus(a.BanStatus):
+			// NOTE: a ban is a STICKY label, not a live verdict. It is written by the
+			// request/refresh paths on an upstream error and nothing ever re-checks
+			// it (reprobeDisabled only revisits BanStatus=="DISABLED"), so this count
+			// can include accounts upstream has since forgiven. Confirming a ban needs
+			// a Kiro-API probe (refresh token, then GetUsageLimits) — a token refresh
+			// alone is not a probe: auth.RefreshToken short-circuits on a live token
+			// and returns success without contacting anyone.
+			st = stBanned
+		case !a.Enabled:
+			st = stDisabled
+		case !poolResident[a.ID] || degraded[a.ID]:
+			// Enabled but not dispatching: quota-blocked (Reload dropped it), in
+			// cooldown, or its circuit is open. All are self-healing, so they read
+			// as cooldown rather than as dead stock.
+			st = stCooldown
+		}
+		if cur, ok := bestState[key]; !ok || st < cur {
+			bestState[key] = st
+		}
+	}
+	census := map[string]int{"active": 0, "cooldown": 0, "banned": 0, "disabled": 0}
+	for _, st := range bestState {
+		switch st {
+		case stActive:
+			census["active"]++
+		case stCooldown:
+			census["cooldown"]++
+		case stDisabled:
+			census["disabled"]++
+		case stBanned:
+			census["banned"]++
+		}
+	}
+	census["total"] = len(bestState)
 
 	// --- Sold side. Only enabled keys hold outstanding quota: exhausted keys
 	// are auto-disabled with ~0 remaining, and manually disabled keys can't
@@ -443,6 +523,17 @@ func (h *Handler) handleAdminPool(w http.ResponseWriter, r *http.Request) {
 			"creditsLimit":     accountsTotal,
 			"creditsUsed":      accountsUsed,
 			"creditsAvailable": accountsAvailable,
+		},
+		// Inventory census over the FULL account config, deduped per Kiro identity.
+		// Distinct from "accounts" above, which only sees pool-resident (enabled,
+		// routable) rows and so can neither see banned stock nor report a true total.
+		// Counts partition the inventory: active+cooldown+banned+disabled == total.
+		"accountStates": map[string]interface{}{
+			"active":   census["active"],
+			"cooldown": census["cooldown"],
+			"banned":   census["banned"],
+			"disabled": census["disabled"],
+			"total":    census["total"],
 		},
 		"sold": map[string]interface{}{
 			"activeKeys":         activeKeys,
@@ -551,7 +642,10 @@ func (h *Handler) handleAdminAddKiroApiKey(w http.ResponseWriter, r *http.Reques
 		// UserId within the same region; a different region for the same account is a
 		// deliberate multi-region slot and is allowed. Fall back to the key value when
 		// the upstream did not return a UserId.
-		if existing := findAccountForKiroIdentity(info.UserId, req.KiroApiKey, region); existing != nil {
+		// email is deliberately "" here: this route's probe reliably returns a
+		// UserId, and matching an API key against an OAuth account by email alone
+		// would be a behavior change for the pre-existing supply path.
+		if existing := findAccountForKiroIdentity(info.UserId, "", req.KiroApiKey, region); existing != nil {
 			added = append(added, addedView{ID: existing.ID, Region: region, Email: existing.Email, Duplicate: true})
 			continue
 		}
@@ -645,26 +739,51 @@ func normalizeRegion(region string) string {
 }
 
 // findAccountForKiroIdentity returns an existing pool account that represents the
-// SAME underlying Kiro account in the same region, or nil. It matches on UserId
-// (the Kiro account identity — stable across the multiple API keys one account can
-// mint) and falls back to the key value when UserId is unknown. Region is part of
-// the match so a deliberate multi-region slot for the same account is not treated
-// as a duplicate.
-func findAccountForKiroIdentity(userID, key, region string) *config.Account {
+// SAME underlying Kiro account in the same region, or nil. Shared by BOTH supply
+// routes (add_kiro_api_key and add_kiro_account) so they can never disagree about
+// what counts as a duplicate — a disagreement means one real Kiro account gets two
+// pool slots, doubling its routing weight and double-counting its quota in
+// /admin/pool.
+//
+// Identity is matched in descending order of reliability:
+//   - UserId — the Kiro account identity, stable across both the many API keys one
+//     account can mint and a re-login that mints fresh tokens.
+//   - email — the only identifier an OAuth probe reliably returns when the upstream
+//     omits a UserId. Callers that have no trustworthy email pass "".
+//   - key value — for API keys whose probe returned no UserId. Only consulted when
+//     non-empty: every OAuth account carries an empty KiroApiKey, so an empty `key`
+//     would match the first OAuth account in the region and report a bogus duplicate.
+//
+// `region` is a DATA-PLANE region, and each candidate is resolved the same way
+// (ARN first, then its Region field) rather than by reading Region directly: for an
+// OAuth account Region is the auth/OIDC region and can legitimately differ from the
+// profile's data-plane region. Reading Region directly here would let the same Kiro
+// identity land in two different region buckets depending on which route added it.
+// Region is part of the match so a deliberate multi-region slot is not a duplicate.
+func findAccountForKiroIdentity(userID, email, key, region string) *config.Account {
 	userID = strings.TrimSpace(userID)
+	email = strings.TrimSpace(email)
 	want := normalizeRegion(region)
 	for _, a := range config.GetAccounts() {
-		// Empty Region means us-east-1 everywhere else in the codebase, so normalize
-		// both sides — otherwise an OAuth account with Region:"" wouldn't dedupe
-		// against a us-east-1 probe of the same Kiro account.
-		if !strings.EqualFold(normalizeRegion(a.Region), want) {
+		candidate := a
+		if !strings.EqualFold(kiroRegionForProfile(&candidate, ""), want) {
 			continue
 		}
-		if userID != "" && strings.TrimSpace(a.UserId) == userID {
+		candidateUser := strings.TrimSpace(a.UserId)
+		if userID != "" && candidateUser == userID {
 			cp := a
 			return &cp
 		}
-		if a.KiroApiKey == key {
+		// Email only decides when it is not contradicted: if BOTH sides know their
+		// UserId and they disagree, these are two different Kiro accounts that
+		// merely share an address (an alias), and matching them would migrate one
+		// slot onto the other's identity.
+		if email != "" && strings.EqualFold(strings.TrimSpace(a.Email), email) &&
+			!(userID != "" && candidateUser != "" && candidateUser != userID) {
+			cp := a
+			return &cp
+		}
+		if key != "" && a.KiroApiKey == key {
 			cp := a
 			return &cp
 		}
@@ -689,4 +808,512 @@ var probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
 		return nil, err
 	}
 	return info, nil
+}
+
+// resolveApiKeyRegion determines the data-plane region a ksk_ key actually serves,
+// returning the region plus the account identity the probe fetched on the way.
+//
+// The Kiro profile is bound to the key server-side, but the data-plane endpoint is
+// regional (getUsageLimits lives on q.{region}.amazonaws.com), so a key only answers
+// in its home region. A wrong region is unrecoverable: api_key accounts never
+// re-probe, because ResolveProfileArn short-circuits for key-bound profiles. So the
+// region is never assumed — an explicit region narrows the probe set to that one
+// region (validating the caller's claim without overriding it), and an empty region
+// probes every candidate. This mirrors handleAdminAddKiroApiKey's probe semantics so
+// the panel, the import path and the bot route cannot disagree about what a usable
+// key is. They still differ on how they REPORT an unusable one: the bot route answers
+// 502 unconditionally (a stable contract its callers depend on), while the callers of
+// this helper split 400/502 on the bool below.
+//
+// The bool reports whether the failure looks retryable: false means every probe was
+// an auth rejection (the key genuinely does not serve those regions — a caller
+// error), true means at least one probe failed for a transient reason (upstream 5xx,
+// timeout, proxy outage), which must not be reported as a bad key.
+func resolveApiKeyRegion(key, explicitRegion string) (string, *config.AccountInfo, bool, error) {
+	targetRegions := kiroApiKeyCandidateRegions()
+	if explicit := strings.TrimSpace(explicitRegion); explicit != "" {
+		targetRegions = []string{explicit}
+	}
+
+	var errs []string
+	retryable := false
+	for _, region := range targetRegions {
+		info, err := probeKiroApiKey(key, region)
+		if err == nil {
+			return region, info, false, nil
+		}
+		if !pool.IsAuthFailure(err) {
+			retryable = true
+		}
+		errs = append(errs, region+": "+err.Error())
+	}
+	return "", nil, retryable, fmt.Errorf("kiroApiKey not usable in any probed region (%s)", strings.Join(errs, "; "))
+}
+
+// adminAddKiroAccountRequest is the body for POST /admin/add_kiro_account.
+// Account is a complete OAuth credential as emitted by the login helpers
+// (kiro-go-login.py), i.e. the same JSON shape the admin panel's
+// POST /admin/api/accounts accepts. Nickname/Enabled mirror the add_kiro_api_key
+// request so both supply-side routes read the same way from the bot.
+type adminAddKiroAccountRequest struct {
+	Account  *config.Account `json:"account"`
+	Nickname string          `json:"nickname,omitempty"`
+	Enabled  *bool           `json:"enabled,omitempty"`
+}
+
+// handleAdminAddKiroAccount POST /admin/add_kiro_account — add an OAuth (social /
+// idc / external_idp) Kiro account to the serving pool.
+//
+// This is the OAuth twin of handleAdminAddKiroApiKey. It exists as a separate
+// machine endpoint (rather than reusing the panel's POST /admin/api/accounts)
+// for three reasons that matter to an automated supply pipeline:
+//
+//   - Auth: this route uses authenticateAdminKey (Bearer or X-Admin-Password, no
+//     cookie), so the bot's existing Bearer client works and no CSRF-capable
+//     cookie path is involved.
+//   - Dedup: the panel route de-duplicates on ID only, and the login helper mints
+//     a fresh UUID per run — so re-uploading one account would silently create a
+//     SECOND pool slot for one real Kiro account, doubling its routing weight and
+//     double-counting its quota in /admin/pool. Here we de-dup on the underlying
+//     Kiro identity, exactly like the API-key route.
+//   - Validation: the panel route persists whatever it is handed. Here the token
+//     is probed upstream first, which both proves the credential works AND yields
+//     the UserId/Email that make dedup (now and on every later re-upload) possible.
+//
+// Unlike the API-key route there is no multi-region probing: an OAuth account's
+// data-plane region is pinned by its profileArn (see kiroRegionForProfile), so
+// exactly one region is ever considered.
+func (h *Handler) handleAdminAddKiroAccount(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	var req adminAddKiroAccountRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if req.Account == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "account is required"})
+		return
+	}
+	account := *req.Account
+
+	// Route contract: OAuth credentials only. An API key posted here would be
+	// persisted without the region probing / ksk_ validation that route performs,
+	// so send the caller to the right endpoint instead of silently half-working.
+	account.KiroApiKey = strings.TrimSpace(account.KiroApiKey)
+	if account.KiroApiKey != "" || account.IsApiKeyCredential() {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "api_key credentials must use /admin/add_kiro_api_key"})
+		return
+	}
+
+	account.AccessToken = strings.TrimSpace(account.AccessToken)
+	if account.AccessToken == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "accessToken is required"})
+		return
+	}
+	account.AuthMethod = strings.TrimSpace(account.AuthMethod)
+	if account.AuthMethod == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "authMethod is required"})
+		return
+	}
+
+	// An OAuth access token lives ~1h. Without the material to refresh it the
+	// account would serve briefly and then fail permanently, which is far more
+	// expensive to diagnose later than a 400 now. Each auth method refreshes via a
+	// different path (auth.RefreshToken), so each needs different material:
+	//   external_idp -> refreshExternalIdpToken(refreshToken, clientId, tokenEndpoint, scopes)
+	//   idc          -> refreshOIDCToken(refreshToken, clientId, clientSecret, region)
+	//   social       -> refreshSocialToken(refreshToken) — refresh token alone
+	if account.RefreshToken == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "refreshToken is required"})
+		return
+	}
+	var missing []string
+	switch {
+	case strings.EqualFold(account.AuthMethod, "external_idp"):
+		if strings.TrimSpace(account.TokenEndpoint) == "" {
+			missing = append(missing, "tokenEndpoint")
+		}
+		if strings.TrimSpace(account.ClientID) == "" {
+			missing = append(missing, "clientId")
+		}
+		if strings.TrimSpace(account.Scopes) == "" {
+			missing = append(missing, "scopes")
+		}
+	case strings.EqualFold(account.AuthMethod, "idc"):
+		// idc refreshes against the AWS SSO OIDC endpoint with the OIDC client
+		// registration, which is a clientId/clientSecret PAIR — a missing secret
+		// fails every refresh with "invalid client".
+		if strings.TrimSpace(account.ClientID) == "" {
+			missing = append(missing, "clientId")
+		}
+		if strings.TrimSpace(account.ClientSecret) == "" {
+			missing = append(missing, "clientSecret")
+		}
+	}
+	if len(missing) > 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": account.AuthMethod + " account is missing refresh material: " + strings.Join(missing, ", "),
+		})
+		return
+	}
+
+	// profileArn is required, not optional. It pins the data-plane region, which is
+	// the bucket dedup compares in — an ARN-less account would bucket by its AUTH
+	// region now and, once the request path lazily resolves and caches an ARN onto
+	// it, silently move to a different bucket, so a later re-upload would miss it
+	// and create a second slot for one Kiro account. Requiring it also keeps the
+	// probe from having to resolve an ARN itself, which can burn a single-use
+	// refresh token on a throwaway copy. Every login helper resolves it eagerly.
+	if strings.TrimSpace(account.ProfileArn) == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is required"})
+		return
+	}
+
+	// Region bucket for dedup + reporting is the DATA-PLANE region (ARN first,
+	// then account.Region), matching how the request path resolves it. Note this
+	// is deliberately NOT written back to account.Region: for "idc" that field is
+	// the auth/OIDC region, which can legitimately differ from the profile's
+	// data-plane region, and overwriting it would point token refresh at the wrong
+	// OIDC endpoint.
+	region := kiroRegionForProfile(&account, "")
+
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	if nickname := strings.TrimSpace(req.Nickname); nickname != "" {
+		account.Nickname = nickname
+	}
+
+	// Always mint our own ID: a caller-supplied one collides with the existing
+	// account on a re-upload of the same file and would fail AddAccount's id check.
+	account.ID = auth.GenerateAccountID()
+	if strings.TrimSpace(account.MachineId) == "" {
+		account.MachineId = config.GenerateMachineId()
+	}
+
+	// Probe: proves the credential serves this region and returns the identity we
+	// de-dup on. A dead token is rejected here rather than becoming a pool slot
+	// that only surfaces later as upstream 403s.
+	info, err := probeKiroAccount(&account)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "account credential not usable: " + err.Error(),
+			"skipped": []map[string]string{{"region": region, "error": err.Error()}},
+		})
+		return
+	}
+
+	type addedView struct {
+		ID        string `json:"id"`
+		Region    string `json:"region"`
+		Email     string `json:"email,omitempty"`
+		Duplicate bool   `json:"duplicate,omitempty"`
+		Repaired  bool   `json:"repaired,omitempty"`
+	}
+
+	// De-dup on the underlying Kiro identity. Email is the fallback because a
+	// social/external_idp probe may return no UserId, and without it a re-upload
+	// would silently double the account's routing weight.
+	identityEmail := info.Email
+	if identityEmail == "" {
+		identityEmail = account.Email
+	}
+	// key is "" — an OAuth credential has no API key to match on.
+	if existing := findAccountForKiroIdentity(info.UserId, identityEmail, "", region); existing != nil {
+		// An api_key slot is NOT adopted onto. Its ksk_ credential never expires,
+		// whereas this OAuth chain dies with its refresh token (~90 days), so
+		// overwriting would be a DOWNGRADE — and it would leave the slot in the
+		// self-contradictory kiroApiKey + external_idp state this very route
+		// rejects at the top. Report the duplicate; keep the stronger credential.
+		if existing.KiroApiKey != "" || existing.IsApiKeyCredential() {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"enabled": existing.Enabled,
+				"added": []addedView{{ID: existing.ID, Region: region,
+					Email: existing.Email, Duplicate: true}},
+				"skipped": []map[string]string{},
+			})
+			return
+		}
+
+		// ADOPT the freshly-minted credential onto the existing slot rather than
+		// discarding it. An OAuth refresh token expires (Entra defaults to ~90
+		// days), and when it does the slot is dead but still in the pool — so
+		// re-running the login and re-uploading is the operator's natural repair.
+		// Discarding the new tokens here would make that repair silently no-op
+		// while reporting "already in pool". The probe above just proved this
+		// credential is live, so it is strictly better than what the slot holds.
+		// "Repaired" means specifically that a BAN was cleared — the slot was dead
+		// and now serves again. A merely-disabled slot is not broken (an operator
+		// may have turned it off on purpose), so re-enabling one per the request's
+		// `enabled` is not something to report as a repair.
+		repaired := existing.BanStatus != "" && existing.BanStatus != "ACTIVE"
+		updated := *existing
+		updated.AccessToken = account.AccessToken
+		updated.RefreshToken = account.RefreshToken
+		updated.ExpiresAt = account.ExpiresAt
+		updated.AuthMethod = account.AuthMethod
+		updated.Region = account.Region
+		// Refresh material can legitimately change between logins (a re-login mints
+		// a NEW idc OIDC client registration; a tenant may move to a new app
+		// registration / scope set), and stale material means the next refresh
+		// fails — so adopt it wholesale alongside the tokens. ClientSecret must
+		// travel WITH ClientID: idc refresh posts them as a pair, so a new id
+		// against a stale secret fails every refresh with "invalid client" and the
+		// repair would never converge.
+		updated.ClientID = account.ClientID
+		updated.ClientSecret = account.ClientSecret
+		updated.TokenEndpoint = account.TokenEndpoint
+		updated.IssuerURL = account.IssuerURL
+		updated.Scopes = account.Scopes
+		if account.StartUrl != "" {
+			updated.StartUrl = account.StartUrl
+		}
+		if account.Provider != "" {
+			updated.Provider = account.Provider
+		}
+		if account.ProfileArn != "" {
+			updated.ProfileArn = account.ProfileArn
+		}
+		if nickname := strings.TrimSpace(req.Nickname); nickname != "" {
+			updated.Nickname = nickname
+		}
+		// Clear the ban and restore serving: whatever the slot was banned for, the
+		// probe proves this credential works now. Honors an explicit enabled:false.
+		updated.Enabled = enabled
+		updated.BanStatus = ""
+		updated.BanReason = ""
+		updated.BanTime = 0
+		// MachineId is deliberately NOT regenerated — it is a stable per-account
+		// device identity for upstream request tracking, and churning it on every
+		// re-upload would make one account look like a fleet of new machines.
+		if err := config.UpdateAccount(existing.ID, updated); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if updateErr := config.UpdateAccountInfo(existing.ID, *info); updateErr != nil {
+			logger.Warnf("[AddKiroAccount] failed to persist account info for %s: %v", existing.ID, updateErr)
+		}
+		h.pool.Reload()
+		if enabled {
+			go func(a config.Account) {
+				if err := h.fetchAndCacheAccountModels(&a); err != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for re-added Kiro account %s: %v", a.Email, err)
+				}
+			}(updated)
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"enabled": enabled,
+			"added": []addedView{{ID: existing.ID, Region: region, Email: updated.Email,
+				Duplicate: true, Repaired: repaired}},
+			"skipped": []map[string]string{},
+		})
+		return
+	}
+
+	if info.Email != "" {
+		account.Email = info.Email
+	}
+	if info.UserId != "" {
+		account.UserId = info.UserId
+	}
+	account.Enabled = enabled
+
+	if err := config.AddAccount(account); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	// Persist the subscription/usage the probe already fetched so /admin/pool
+	// reflects real quota immediately, not only after the next background refresh.
+	if updateErr := config.UpdateAccountInfo(account.ID, *info); updateErr != nil {
+		logger.Warnf("[AddKiroAccount] failed to persist account info for %s: %v", account.ID, updateErr)
+	}
+
+	h.pool.Reload()
+	if enabled {
+		go func(a config.Account) {
+			if err := h.fetchAndCacheAccountModels(&a); err != nil {
+				logger.Warnf("[ModelsCache] Auto-refresh failed for new Kiro account %s: %v", a.Email, err)
+			}
+		}(account)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"enabled": enabled,
+		"added":   []addedView{{ID: account.ID, Region: region, Email: account.Email}},
+		"skipped": []map[string]string{},
+	})
+}
+
+// probeKiroAccount validates an OAuth credential against the upstream and returns
+// the underlying Kiro account info (identity + subscription + usage). It probes a
+// COPY so a ban/refresh write inside RefreshAccountInfo can never mutate the
+// caller's struct, and the copy's ID is one that is not yet in config, so the
+// ban path's UpdateAccount is a no-op. Package var so tests can stub the
+// upstream round-trip.
+var probeKiroAccount = func(account *config.Account) (*config.AccountInfo, error) {
+	probe := *account
+	info, err := RefreshAccountInfo(&probe)
+	if err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// adminAddCustomApiRequest is the body for POST /admin/add_custom_api_account.
+// A Custom API account is a transparent proxy to ANOTHER Kiro-Go pool: BaseURL
+// is that pool's root and ApiKey is a key that pool issued to us.
+type adminAddCustomApiRequest struct {
+	BaseURL  string   `json:"baseUrl"`            // Upstream pool root (required)
+	ApiKey   string   `json:"apiKey"`             // Upstream bearer token (required)
+	OrderID  string   `json:"orderId"`            // Order id; required; doubles as the account name
+	Nickname string   `json:"nickname,omitempty"` // Optional display name; defaults to orderId
+	Tags     []string `json:"tags,omitempty"`     // Extra tags; "Custom API" is always added
+	Enabled  *bool    `json:"enabled,omitempty"`  // Route traffic immediately (default true)
+}
+
+// findCustomApiDuplicate returns an existing account that would collide with a new
+// Custom API add, or nil. A collision is the same OrderID, or the same
+// (BaseURL, ApiKey) pair — either means the operator is adding the same upstream twice.
+func findCustomApiDuplicate(orderID, baseURL, apiKey string) *config.Account {
+	orderID = strings.TrimSpace(orderID)
+	for _, a := range config.GetAccounts() {
+		if !strings.EqualFold(strings.TrimSpace(a.AuthMethod), "custom_api") {
+			continue
+		}
+		if orderID != "" && strings.EqualFold(strings.TrimSpace(a.OrderID), orderID) {
+			cp := a
+			return &cp
+		}
+		if a.BaseURL == baseURL && a.KiroApiKey == apiKey {
+			cp := a
+			return &cp
+		}
+	}
+	return nil
+}
+
+// addCustomApiAccount validates and persists a Custom API (pool-linking) account.
+// It is transport-agnostic so both the HTTP handler and the Telegram bot command
+// share one validation path. Returns the new account id, an HTTP-style status code,
+// and an error describing any rejection. Order of checks: required fields → base URL
+// normalization → dedup (cheap, before the network) → upstream quota probe.
+func (h *Handler) addCustomApiAccount(req adminAddCustomApiRequest) (string, int, error) {
+	apiKey := strings.TrimSpace(req.ApiKey)
+	orderID := strings.TrimSpace(req.OrderID)
+	if apiKey == "" {
+		return "", http.StatusBadRequest, fmt.Errorf("apiKey is required")
+	}
+	if orderID == "" {
+		return "", http.StatusBadRequest, fmt.Errorf("orderId is required")
+	}
+	baseURL, err := normalizeBaseURL(req.BaseURL)
+	if err != nil {
+		return "", http.StatusBadRequest, err
+	}
+
+	// Dedup BEFORE the network probe so a repeat add is cheap and can't be rejected
+	// for a transient upstream blip.
+	if dup := findCustomApiDuplicate(orderID, baseURL, apiKey); dup != nil {
+		return dup.ID, http.StatusConflict, fmt.Errorf("duplicate custom API account")
+	}
+
+	// Quota check is best-effort, NOT a gate: a reachable upstream lets us persist the
+	// quota for immediate display, but an unreachable/zero-quota upstream must not block
+	// adding the account (the key may be provisioned later, or the endpoint temporarily
+	// down). quota is applied after AddAccount below when the probe succeeded.
+	quota, quotaErr := probeCustomApiQuota(baseURL, apiKey)
+	if quotaErr != nil {
+		logger.Warnf("[AddCustomApi] quota check failed for orderId=%s (%s), adding anyway: %v", orderID, baseURL, quotaErr)
+	}
+
+	nickname := strings.TrimSpace(req.Nickname)
+	if nickname == "" {
+		nickname = orderID
+	}
+	// Final tag set: "Custom API" plus any extras, de-duplicated.
+	tags := []string{"Custom API"}
+	for _, t := range req.Tags {
+		if t = strings.TrimSpace(t); t != "" && !strings.EqualFold(t, "Custom API") {
+			tags = append(tags, t)
+		}
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	account := config.Account{
+		ID:          auth.GenerateAccountID(),
+		Nickname:    nickname,
+		AuthMethod:  "custom_api",
+		BaseURL:     baseURL,
+		KiroApiKey:  apiKey, // upstream bearer
+		AccessToken: apiKey, // mirror for pool compatibility (see apiAddAccount)
+		OrderID:     orderID,
+		Tags:        tags,
+		Enabled:     enabled,
+		ExpiresAt:   0, // never refreshed
+		MachineId:   config.GenerateMachineId(),
+	}
+	if err := config.AddAccount(account); err != nil {
+		return "", http.StatusInternalServerError, err
+	}
+	// Persist the upstream quota only if the probe succeeded; otherwise the panel shows
+	// it after the next background refresh once the upstream is reachable.
+	if quotaErr == nil && quota != nil && quota.OK {
+		if updateErr := config.UpdateAccountInfo(account.ID, quota.toAccountInfo(time.Now().Unix())); updateErr != nil {
+			logger.Warnf("[AddCustomApi] failed to persist quota for %s: %v", account.ID, updateErr)
+		}
+	}
+	h.pool.Reload()
+	return account.ID, http.StatusOK, nil
+}
+
+// handleAdminAddCustomApiAccount POST /admin/add_custom_api_account — add a
+// pool-linking account that forwards traffic to another Kiro-Go pool. Validates
+// order id and dedup before persisting; the upstream quota probe is best-effort
+// (populates quota when reachable, never blocks the add). Mirrors the shape of
+// handleAdminAddKiroApiKey so the bot and panel read the same way.
+func (h *Handler) handleAdminAddCustomApiAccount(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	var req adminAddCustomApiRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	id, status, err := h.addCustomApiAccount(req)
+	if err != nil {
+		w.WriteHeader(status)
+		resp := map[string]interface{}{"error": err.Error()}
+		if status == http.StatusConflict && id != "" {
+			resp["id"] = id
+		}
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"id":      id,
+	})
 }

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"math"
+	"sort"
 	"strings"
 )
 
@@ -19,19 +19,21 @@ const (
 type ModelReasoningCapability struct {
 	ModelID string
 
-	SupportsThinking       bool
-	ThinkingTypes          []string
-	SupportsDisplay        bool
-	SupportsBudgetTokens   bool
-	EffortPath             ReasoningSchemaPath
-	Efforts                []string
-	SchemaParseError       string
+	SupportsThinking     bool
+	ThinkingTypes        []string
+	SupportsDisplay      bool
+	ThinkingDisplays     []string
+	SupportsBudgetTokens bool
+	EffortPath           ReasoningSchemaPath
+	Efforts              []string
+	SchemaParseError     string
 }
 
 func (c ModelReasoningCapability) SupportsNativeReasoning() bool {
 	return c.SupportsThinking || c.EffortPath != ReasoningSchemaNone
 }
 
+// Parse thinking and effort support from the model schema.
 func ParseModelReasoningCapability(model ModelInfo) ModelReasoningCapability {
 	capability := ModelReasoningCapability{
 		ModelID: model.ModelId,
@@ -61,8 +63,10 @@ func ParseModelReasoningCapability(model ModelInfo) ModelReasoningCapability {
 		capability.ThinkingTypes = enumStrings(
 			schemaObject(thinkingProps["type"]),
 		)
-		capability.SupportsDisplay =
-			thinkingProps != nil && thinkingProps["display"] != nil
+		displaySchema := schemaObject(thinkingProps["display"])
+
+		capability.SupportsDisplay = displaySchema != nil
+		capability.ThinkingDisplays = enumStrings(displaySchema)
 		capability.SupportsBudgetTokens =
 			thinkingProps != nil && thinkingProps["budget_tokens"] != nil
 	}
@@ -118,7 +122,6 @@ func decodeModelRequestSchema(raw json.RawMessage) (map[string]interface{}, erro
 
 	return nil, fmt.Errorf("schema nesting is too deep")
 }
-
 
 func unwrapAdditionalFieldsSchema(
 	root map[string]interface{},
@@ -207,6 +210,7 @@ func canonicalEffort(value string) string {
 	}
 }
 
+// Normalize aliases while preserving schema-provided values.
 func normalizeEffortList(values []string) []string {
 	byCanonical := make(map[string]string)
 
@@ -229,9 +233,13 @@ func normalizeEffortList(values []string) []string {
 		}
 	}
 
+	unknown := make([]string, 0, len(byCanonical))
+
 	for _, original := range byCanonical {
-		ordered = append(ordered, original)
+		unknown = append(unknown, original)
 	}
+	sort.Strings(unknown)
+	ordered = append(ordered, unknown...)
 
 	return ordered
 }
@@ -243,7 +251,6 @@ type reasoningIntent struct {
 	Display      string
 	Effort       string
 	BudgetTokens int
-	MaxTokens    int
 }
 
 func BuildClaudeAdditionalModelRequestFields(
@@ -258,9 +265,7 @@ func BuildClaudeAdditionalModelRequestFields(
 		return nil, false, nil
 	}
 
-	intent := reasoningIntent{
-		MaxTokens: req.MaxTokens,
-	}
+	intent := reasoningIntent{}
 
 	if req.Thinking != nil {
 		intent.ThinkingType = strings.ToLower(
@@ -304,9 +309,7 @@ func BuildOpenAIAdditionalModelRequestFields(
 		return nil, false, nil
 	}
 
-	intent := reasoningIntent{
-		MaxTokens: req.MaxTokens,
-	}
+	intent := reasoningIntent{}
 
 	if req.Thinking != nil {
 		intent.ThinkingType = strings.ToLower(
@@ -341,6 +344,7 @@ func BuildOpenAIAdditionalModelRequestFields(
 	return buildAdditionalModelRequestFields(intent, capability)
 }
 
+// Build only fields advertised by the model schema.
 func buildAdditionalModelRequestFields(
 	intent reasoningIntent,
 	capability ModelReasoningCapability,
@@ -372,24 +376,61 @@ func buildAdditionalModelRequestFields(
 	if capability.SupportsThinking {
 		thinking := make(map[string]interface{})
 
-		thinkingType := selectThinkingType(
+		thinkingType, ok := selectThinkingType(
 			intent.ThinkingType,
 			capability.ThinkingTypes,
 		)
+
+		if !ok {
+			return nil, true, fmt.Errorf(
+				"model %s does not support thinking.type %q; supported: %s",
+				capability.ModelID,
+				intent.ThinkingType,
+				strings.Join(
+					capability.ThinkingTypes,
+					", ",
+				),
+			)
+		}
+
 		if thinkingType != "" {
 			thinking["type"] = thinkingType
 		}
 
-		if capability.SupportsDisplay && intent.Display != "" {
-			switch intent.Display {
-			case "summarized", "omitted":
-				thinking["display"] = intent.Display
-			default:
+		if intent.Display != "" {
+			if !capability.SupportsDisplay {
 				return nil, true, fmt.Errorf(
-					"unsupported thinking.display %q",
-					intent.Display,
+					"model %s does not support thinking.display",
+					capability.ModelID,
 				)
 			}
+
+			display := intent.Display
+
+			// If the schema defines an enum, only accept values present in the enum.
+			if len(capability.ThinkingDisplays) > 0 {
+				var ok bool
+
+				display, ok = matchSupportedDisplay(
+					intent.Display,
+					capability.ThinkingDisplays,
+				)
+				if !ok {
+					return nil, true, fmt.Errorf(
+						"model %s does not support thinking.display %q; supported: %s",
+						capability.ModelID,
+						intent.Display,
+						strings.Join(
+							capability.ThinkingDisplays,
+							", ",
+						),
+					)
+				}
+			}
+
+			// If the schema defines a field but no enum:
+			// forward the original value sent by the client.
+			thinking["display"] = display
 		}
 
 		if capability.SupportsBudgetTokens &&
@@ -403,16 +444,6 @@ func buildAdditionalModelRequestFields(
 	}
 
 	effort := strings.TrimSpace(intent.Effort)
-
-	if effort == "" &&
-		intent.BudgetTokens > 0 &&
-		len(capability.Efforts) > 0 {
-		effort = effortFromBudget(
-			intent.BudgetTokens,
-			intent.MaxTokens,
-			capability.Efforts,
-		)
-	}
 
 	if effort != "" {
 		supportedEffort, ok := matchSupportedEffort(
@@ -454,34 +485,41 @@ func buildAdditionalModelRequestFields(
 	return fields, true, nil
 }
 
-func selectThinkingType(
-	requested string,
-	supported []string,
-) string {
-	requested = strings.ToLower(strings.TrimSpace(requested))
+func selectThinkingType(requested string, supported []string) (string, bool) {
+	requested = strings.TrimSpace(requested)
 
-	if len(supported) == 0 {
-		if requested == "enabled" || requested == "adaptive" {
-			return requested
-		}
-		return "adaptive"
-	}
-
-	for _, supportedType := range supported {
-		if strings.EqualFold(supportedType, requested) {
-			return supportedType
-		}
-	}
-
-	for _, preferred := range []string{"adaptive", "enabled"} {
+	if requested != "" {
 		for _, supportedType := range supported {
-			if strings.EqualFold(supportedType, preferred) {
-				return supportedType
+			if strings.EqualFold(
+				supportedType,
+				requested,
+			) {
+				return supportedType, true
+			}
+		}
+
+		return "", false
+	}
+
+	for _, preferred := range []string{
+		"adaptive",
+		"enabled",
+	} {
+		for _, supportedType := range supported {
+			if strings.EqualFold(
+				supportedType,
+				preferred,
+			) {
+				return supportedType, true
 			}
 		}
 	}
 
-	return supported[0]
+	if len(supported) > 0 {
+		return supported[0], true
+	}
+
+	return "", false
 }
 
 func matchSupportedEffort(
@@ -499,36 +537,19 @@ func matchSupportedEffort(
 	return "", false
 }
 
-func effortFromBudget(
-	budgetTokens int,
-	maxTokens int,
+func matchSupportedDisplay(
+	requested string,
 	supported []string,
-) string {
-	if len(supported) == 0 {
-		return ""
+) (string, bool) {
+	requested = strings.TrimSpace(requested)
+
+	for _, value := range supported {
+		if strings.EqualFold(value, requested) {
+			return value, true
+		}
 	}
 
-	if maxTokens <= 0 || budgetTokens <= 0 {
-		return supported[len(supported)/2]
-	}
-
-	ratio := float64(budgetTokens) / float64(maxTokens)
-	if ratio < 0 {
-		ratio = 0
-	}
-	if ratio > 1 {
-		ratio = 1
-	}
-
-	index := int(math.Ceil(ratio*float64(len(supported)))) - 1
-	if index < 0 {
-		index = 0
-	}
-	if index >= len(supported) {
-		index = len(supported) - 1
-	}
-
-	return supported[index]
+	return "", false
 }
 
 func reasoningFieldsJSON(

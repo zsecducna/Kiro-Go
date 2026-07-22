@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+// Diagnostic flags are read once at startup.
+// Raw chunk logs require a separate opt-in.
 var (
 	masterEnabled = envBool("KIRO_DIAGNOSTICS")
 

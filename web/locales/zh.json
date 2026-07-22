@@ -127,6 +127,11 @@
   "settings.proxyUsername": "用户名",
   "settings.proxyPassword": "密码",
   "settings.proxyHostRequired": "请填写代理地址和端口",
+  "settings.proxyPool": "代理轮换池（每行一个 URL）",
+  "settings.proxyPoolHint": "设置后，全局代理将按此列表轮流切换，忽略上方的单个代理；账号级代理仍优先。例如 socks5://user:pass@host:port",
+  "settings.proxyRotateMinutes": "轮换间隔（分钟）",
+  "settings.proxyActive": "当前使用",
+  "settings.proxyFormatError": "每个代理必须以 http://、https://、socks5:// 或 socks5h:// 开头",
   "settings.saveProxy": "保存代理设置",
   "settings.proxySaved": "代理设置已保存",
   "settings.promptFilter": "System Prompt 过滤",
@@ -504,5 +509,15 @@
   "apikey.nicknamePlaceholder": "例如 headless-worker-1",
   "apikey.keyLabel": "Kiro API 密钥",
   "apikey.keyMissing": "请输入 Kiro API 密钥",
-  "apikey.success": "已添加 API 密钥账号"
+  "apikey.success": "已添加 API 密钥账号",
+  "auth.customApi": "自定义 API",
+  "modal.customApiTitle": "自定义 API",
+  "modal.customApiDesc": "对接另一个 Kiro-Go 池：使用对方签发给你的密钥，将流量转发到其 Base URL。",
+  "customApi.baseUrl": "Base URL",
+  "customApi.apiKey": "API 密钥",
+  "customApi.orderId": "密钥名称",
+  "customApi.tags": "标签",
+  "customApi.orderIdPlaceholder": "例如 ORD-1234 或该密钥的名称",
+  "customApi.missingFields": "Base URL、API 密钥、订单号均为必填",
+  "customApi.success": "已添加自定义 API 账号"
 }

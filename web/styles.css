@@ -1724,15 +1724,49 @@ img.brand-icon {
 }
 
 /* Account cards */
+/* Compact account cards: pack 2-3 per row on wide screens, collapse to a
+   single column on narrow ones. Card margin-bottom is dropped in favour of the
+   grid gap. */
+#accountsList {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 0.75rem;
+  align-items: start;
+}
 .account-card {
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 1rem 1.25rem;
-  margin-bottom: 0.75rem;
   transition:
     border-color 0.15s,
     background-color 0.15s;
+}
+@media (max-width: 560px) {
+  #accountsList {
+    grid-template-columns: 1fr;
+  }
+}
+/* API key cards reuse the same 2-3-per-row compact grid. Unlike account cards,
+   these keep the tokens/credits/requests usage lines. */
+#apiKeysList {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 0.75rem;
+  align-items: start;
+}
+#apiKeysList > .card {
+  margin-top: 0 !important;
+}
+@media (max-width: 560px) {
+  #apiKeysList {
+    grid-template-columns: 1fr;
+  }
+}
+/* Empty/placeholder rows should span the whole grid, not sit in one column. */
+#accountsList > .empty-state,
+#apiKeysList > .muted-text {
+  grid-column: 1 / -1;
 }
 .account-card:hover {
   border-color: var(--border-focus);
@@ -1745,13 +1779,15 @@ img.brand-icon {
   opacity: 0.6;
   pointer-events: none;
 }
+/* Compact cards live in a narrow grid column, so the header always stacks: info on
+   top (full width), actions wrap underneath. Prevents the action buttons from
+   squeezing the email/badges into a sliver. */
 .account-header {
   display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 0.75rem;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.625rem;
   margin-bottom: 0.75rem;
-  flex-wrap: wrap;
 }
 .account-info {
   display: flex;
@@ -1764,7 +1800,10 @@ img.brand-icon {
   font-size: 0.9375rem;
   font-weight: 600;
   color: var(--foreground);
-  word-break: break-all;
+  /* Break only when a token is genuinely too long, at any point — never split the
+     masked email char-by-char when there is room. */
+  overflow-wrap: anywhere;
+  word-break: normal;
   line-height: 1.4;
 }
 .account-meta {
@@ -1813,17 +1852,11 @@ img.brand-icon {
   }
 }
 .account-stats {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  justify-items: center;
-  gap: 0.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
   padding-top: 0.75rem;
   border-top: 1px solid var(--border);
-}
-@media (max-width: 640px) {
-  .account-stats {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 @media (max-width: 720px) {
   .account-header {
@@ -1858,10 +1891,9 @@ img.brand-icon {
 .account-stat {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  width: 100%;
+  align-items: flex-start;
   gap: 0.125rem;
-  text-align: center;
+  text-align: left;
 }
 .account-stat-value {
   font-size: 0.875rem;

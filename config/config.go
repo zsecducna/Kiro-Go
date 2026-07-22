@@ -41,6 +41,14 @@ type Account struct {
 	UserId   string `json:"userId,omitempty"`   // Kiro user ID
 	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
 
+	// Custom API (pool-linking) fields. Present only when AuthMethod == "custom_api":
+	// the account is a transparent proxy to ANOTHER Kiro-Go pool rather than a direct
+	// Kiro credential. The upstream bearer token is stored in KiroApiKey (its existing
+	// "upstream bearer, never refreshed" role); these fields carry the rest.
+	BaseURL string   `json:"baseUrl,omitempty"` // Upstream pool root, e.g. https://pool.example.com (no trailing /v1)
+	OrderID string   `json:"orderId,omitempty"` // Order id; also used as the account name/nickname
+	Tags    []string `json:"tags,omitempty"`    // Labels; custom_api accounts carry ["Custom API"]
+
 	// Authentication credentials
 	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
 	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
@@ -62,6 +70,34 @@ type Account struct {
 	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // External IdP OAuth2 token endpoint (refresh)
 	IssuerURL     string `json:"issuerUrl,omitempty"`     // External IdP OIDC issuer URL
 	Scopes        string `json:"scopes,omitempty"`        // Space-separated scopes granted by the external IdP
+
+	// Native Amazon Bedrock fields. Present only when AuthMethod == "bedrock":
+	// the account calls the Bedrock Runtime invoke endpoints directly with a static
+	// IAM access key, SigV4-signed. Region reuses the existing Region field above.
+	// BedrockModelMap optionally overrides client-model -> Bedrock-model-id resolution
+	// per account; when nil the env BEDROCK_MODEL_MAP and built-in defaults apply.
+	// NOTE: the secret is stored as-is in the config JSON, matching how OAuth tokens
+	// and Kiro API keys are already persisted here; protect the config file at rest.
+	BedrockAccessKeyID     string `json:"bedrockAccessKeyId,omitempty"`
+	BedrockSecretAccessKey string `json:"bedrockSecretAccessKey,omitempty"`
+	BedrockSessionToken    string `json:"bedrockSessionToken,omitempty"` // set only for STS/temporary credentials
+	// BedrockAPIKey is a Bedrock API key (bearer token, "ABSK..."). When set it is
+	// used as an Authorization: Bearer header and SigV4 is skipped; it authenticates
+	// principals whose raw IAM access key is denied InvokeModel. Either this OR the
+	// access key/secret pair is required for a bedrock account.
+	BedrockAPIKey string `json:"bedrockApiKey,omitempty"`
+	// BedrockRegions are EXTRA candidate regions (beyond Region) to try for this
+	// account. Bedrock model access is per-region: a model denied in the primary
+	// region may be callable in another. The request path tries Region first, then
+	// these, caching the callable region per model. Empty = single-region (Region).
+	BedrockRegions  []string          `json:"bedrockRegions,omitempty"`
+	BedrockModelMap map[string]string `json:"bedrockModelMap,omitempty"`
+	// BedrockUseConverse opts this account into the Bedrock Converse API path
+	// (bedrock-runtime /converse[-stream]) instead of the native Anthropic invoke
+	// path. Required for non-Anthropic models (Nova, Llama, DeepSeek, ...), which do
+	// not accept the Anthropic Messages wire format. Defaults false: Claude models
+	// stay on the zero-translation native invoke path.
+	BedrockUseConverse bool `json:"bedrockUseConverse,omitempty"`
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
@@ -125,6 +161,26 @@ type Account struct {
 // token-refreshed (ExpiresAt stays 0).
 func (a *Account) IsApiKeyCredential() bool {
 	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "api_key")
+}
+
+// IsCustomApi reports whether the account is a "Custom API" pool-linking account:
+// a transparent proxy to ANOTHER Kiro-Go pool (BaseURL + a key it issued us), not a
+// direct Kiro credential. Such accounts must be excluded from every Kiro/AWS-facing
+// path (token refresh, usage-limit probes, model-list probes, ban classifiers) —
+// their AccessToken mirrors a non-Kiro upstream key, so a Kiro API call would fail
+// and the failure would wrongly auto-ban a healthy account.
+func (a *Account) IsCustomApi() bool {
+	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "custom_api")
+}
+
+// IsBedrock reports whether the account is a native Amazon Bedrock account:
+// a static IAM access key + region that calls the Bedrock Runtime invoke endpoints
+// directly (SigV4). Like custom_api, such accounts must be excluded from every
+// Kiro/AWS-SSO-facing path (OAuth token refresh, Kiro usage/model probes, ban
+// classifiers) — they have no Kiro credential to refresh and a Kiro API call on
+// their behalf would fail and wrongly ban a healthy account.
+func (a *Account) IsBedrock() bool {
+	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "bedrock")
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
@@ -206,6 +262,16 @@ type Config struct {
 	//         "http://host:port",  "http://user:pass@host:port"
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
+
+	// ProxyURLs is an optional pool of outbound proxies rotated round-robin every
+	// ProxyRotateMinutes. When non-empty it drives the GLOBAL proxy (the single
+	// ProxyURL above is ignored for routing); per-account ProxyURL overrides still
+	// take precedence. Each entry uses the same scheme format as ProxyURL.
+	ProxyURLs []string `json:"proxyURLs,omitempty"`
+
+	// ProxyRotateMinutes is the round-robin interval for ProxyURLs. <=0 falls back to
+	// DefaultProxyRotateMinutes. Ignored when ProxyURLs is empty.
+	ProxyRotateMinutes int `json:"proxyRotateMinutes,omitempty"`
 
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
@@ -888,6 +954,10 @@ func UpdateEndpointFallback(enabled bool) error {
 	return Save()
 }
 
+// DefaultProxyRotateMinutes is the round-robin interval used when a proxy pool is
+// configured without an explicit (or with a non-positive) ProxyRotateMinutes.
+const DefaultProxyRotateMinutes = 10
+
 // GetProxyURL 获取出站代理地址
 func GetProxyURL() string {
 	cfgLock.RLock()
@@ -895,11 +965,33 @@ func GetProxyURL() string {
 	return cfg.ProxyURL
 }
 
-// UpdateProxySettings 更新出站代理配置
-func UpdateProxySettings(proxyURL string) error {
+// GetProxyURLs returns the outbound proxy rotation pool (may be empty).
+func GetProxyURLs() []string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	// Copy so callers cannot mutate the shared config slice.
+	out := make([]string, len(cfg.ProxyURLs))
+	copy(out, cfg.ProxyURLs)
+	return out
+}
+
+// GetProxyRotateMinutes returns the rotation interval, normalized to a positive value.
+func GetProxyRotateMinutes() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.ProxyRotateMinutes <= 0 {
+		return DefaultProxyRotateMinutes
+	}
+	return cfg.ProxyRotateMinutes
+}
+
+// UpdateProxySettings 更新出站代理配置 (single proxy + rotation pool + interval).
+func UpdateProxySettings(proxyURL string, proxyURLs []string, rotateMinutes int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
+	cfg.ProxyURLs = proxyURLs
+	cfg.ProxyRotateMinutes = rotateMinutes
 	return Save()
 }
 

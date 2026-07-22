@@ -3,22 +3,22 @@ package proxy
 import "encoding/json"
 
 type ResponsesRequest struct {
-	Model              string            `json:"model"`
-	Input              json.RawMessage   `json:"input"`
-	Instructions       string            `json:"instructions,omitempty"`
-	Stream             bool              `json:"stream,omitempty"`
-	Tools              []OpenAITool      `json:"tools,omitempty"`
-	ToolChoice         json.RawMessage   `json:"tool_choice,omitempty"`
-	PreviousResponseID string            `json:"previous_response_id,omitempty"`
-	Store              *bool             `json:"store,omitempty"`
-	Temperature        *float64          `json:"temperature,omitempty"`
-	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty"`
-  // OpenAI Responses API reasoning shape.
+	Model              string          `json:"model"`
+	Input              json.RawMessage `json:"input"`
+	Instructions       string          `json:"instructions,omitempty"`
+	Stream             bool            `json:"stream,omitempty"`
+	Tools              []OpenAITool    `json:"tools,omitempty"`
+	ToolChoice         json.RawMessage `json:"tool_choice,omitempty"`
+	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	Store              *bool           `json:"store,omitempty"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	MaxOutputTokens    *int            `json:"max_output_tokens,omitempty"`
+	// OpenAI Responses API reasoning shape.
 	Reasoning *ResponsesReasoningConfig `json:"reasoning,omitempty"`
 	// Optional compatibility shapes.
 	Thinking     *ClaudeThinkingConfig `json:"thinking,omitempty"`
 	OutputConfig *ClaudeOutputConfig   `json:"output_config,omitempty"`
-	Metadata           map[string]string `json:"metadata,omitempty"`
+	Metadata     map[string]string     `json:"metadata,omitempty"`
 }
 
 type ResponsesObject struct {

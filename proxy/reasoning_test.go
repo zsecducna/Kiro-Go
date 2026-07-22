@@ -52,6 +52,77 @@ func TestParseOutputConfigReasoningSchema(t *testing.T) {
 			capability.Efforts,
 		)
 	}
+	if len(capability.ThinkingDisplays) != 2 {
+		t.Fatalf(
+			"unexpected thinking displays: %#v",
+			capability.ThinkingDisplays,
+		)
+	}
+}
+
+func TestRejectUnsupportedThinkingDisplay(
+	t *testing.T,
+) {
+	req := &ClaudeRequest{
+		Model: "test-model",
+		Thinking: &ClaudeThinkingConfig{
+			Type:    "adaptive",
+			Display: "full",
+		},
+	}
+
+	capability := ModelReasoningCapability{
+		ModelID:          "test-model",
+		SupportsThinking: true,
+		ThinkingTypes:    []string{"adaptive"},
+		SupportsDisplay:  true,
+		ThinkingDisplays: []string{
+			"summarized",
+			"omitted",
+		},
+	}
+
+	_, _, err :=
+		BuildClaudeAdditionalModelRequestFields(
+			req,
+			capability,
+		)
+
+	if err == nil {
+		t.Fatal(
+			"expected unsupported display error",
+		)
+	}
+}
+
+func TestRejectUnsupportedThinkingType(
+	t *testing.T,
+) {
+	req := &ClaudeRequest{
+		Model: "test-model",
+		Thinking: &ClaudeThinkingConfig{
+			Type:         "enabled",
+			BudgetTokens: 4096,
+		},
+	}
+
+	capability := ModelReasoningCapability{
+		ModelID:          "test-model",
+		SupportsThinking: true,
+		ThinkingTypes:    []string{"adaptive"},
+	}
+
+	_, _, err :=
+		BuildClaudeAdditionalModelRequestFields(
+			req,
+			capability,
+		)
+
+	if err == nil {
+		t.Fatal(
+			"expected unsupported thinking type error",
+		)
+	}
 }
 
 func TestParseReasoningPathSchema(t *testing.T) {

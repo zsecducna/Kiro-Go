@@ -7,9 +7,9 @@ import (
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
+	"kiro-go/diagnostics"
 	"kiro-go/logger"
 	"kiro-go/pool"
-  "kiro-go/diagnostics"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -61,6 +61,13 @@ type Handler struct {
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
+	// custom_api (pool-linking) real-cost billing: tracks the last known upstream
+	// creditsUsed per account so each forwarded request is billed the real delta
+	// the upstream pool deducted, not a flat token-derived price.
+	customApiLedger *customApiCreditLedger
+	// proxyRotator rotates the global outbound proxy through a configured pool on a
+	// timer (round-robin). Inert when no pool is configured.
+	proxyRotator *proxyRotator
 }
 
 type thinkingStreamSource int
@@ -233,9 +240,6 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 }
 
 func NewHandler() *Handler {
-	// 启动时应用代理配置
-	applyProxyConfig(config.GetProxyURL())
-
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
 		pool:            pool.GetPool(),
@@ -248,7 +252,14 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		customApiLedger: newCustomApiCreditLedger(),
 	}
+	// 启动时应用代理配置
+	// Outbound proxy: a rotator applies the global proxy, cycling a pool when one is
+	// configured. When no pool is set it just applies the single ProxyURL once.
+	h.proxyRotator = newProxyRotator(applyProxyConfig)
+	h.proxyRotator.configure(config.GetProxyURL(), config.GetProxyURLs(), config.GetProxyRotateMinutes())
+
 	cachePath := filepath.Join(config.GetConfigDir(), "prompt_cache.json")
 	h.promptCache.Load(cachePath)
 	h.promptCache.startSaveLoop(cachePath, 30*time.Second)
@@ -288,6 +299,20 @@ func (h *Handler) refreshAllAccounts() {
 	for i := range accounts {
 		account := &accounts[i]
 		if !account.Enabled || account.AccessToken == "" {
+			continue
+		}
+		// Custom API accounts have no Kiro token/usage: refresh their quota from the
+		// linked upstream pool's /api/me instead of AWS (which would 403 and auto-ban).
+		if account.IsBedrock() {
+			continue // static IAM creds: no Kiro quota to refresh
+		}
+		if account.IsCustomApi() {
+			quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
+			if err != nil {
+				logger.Warnf("[BackgroundRefresh] custom_api quota fetch failed for %s: %v", account.ID, err)
+				continue
+			}
+			config.UpdateAccountInfo(account.ID, quota.toAccountInfo(time.Now().Unix()))
 			continue
 		}
 
@@ -453,6 +478,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleAdminAddKiroApiKey(w, r)
+	case path == "/admin/add_kiro_account" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminAddKiroAccount(w, r)
+	case path == "/admin/add_custom_api_account" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminAddCustomApiAccount(w, r)
+	case path == "/admin/add_bedrock_account" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminAddBedrockAccount(w, r)
 
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
@@ -637,6 +677,26 @@ func (h *Handler) refreshModelsCache() {
 	aggregated := make([]ModelInfo, 0)
 	for i := range accounts {
 		account := &accounts[i]
+		// Custom API accounts load their model list from the linked upstream pool's
+		// /v1/models (not Kiro/AWS): fetch, cache for routing, and aggregate into the
+		// global model list. On failure, skip without banning.
+		if account.IsBedrock() {
+			continue // Bedrock models resolved locally; no upstream probe
+		}
+		if account.IsCustomApi() {
+			models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
+			if err != nil {
+				logger.Warnf("[ModelsCache] custom_api %s model fetch failed: %v", account.ID, err)
+				continue
+			}
+			modelIDs := make([]string, 0, len(models))
+			for _, m := range models {
+				modelIDs = append(modelIDs, m.ModelId)
+			}
+			h.pool.SetModelList(account.ID, modelIDs)
+			aggregated = mergeUniqueModels(aggregated, models)
+			continue
+		}
 		if err := h.ensureValidToken(account); err != nil {
 			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
 			h.handleAccountFailure(account, err)
@@ -670,6 +730,38 @@ func (h *Handler) refreshModelsCache() {
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
 // 同时更新 pool 的路由缓存与全局聚合模型列表。
 func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
+	// Custom API accounts load their model list from the linked upstream pool's
+	// /v1/models (not Kiro/AWS), then cache it for routing.
+	if account.IsBedrock() {
+		// Bedrock has no Kiro/AWS /v1/models endpoint: resolve the callable model
+		// list via control-plane discovery (falling back to the account/default
+		// map) and cache it so the panel's cached-models view and routing work.
+		ids := h.cachedOrDiscoverBedrockModels(account)
+		if len(ids) == 0 {
+			for _, v := range account.BedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		if len(ids) == 0 {
+			for _, v := range defaultBedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		h.pool.SetModelList(account.ID, ids)
+		return nil
+	}
+	if account.IsCustomApi() {
+		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
+		if err != nil {
+			return err
+		}
+		modelIDs := make([]string, 0, len(models))
+		for _, m := range models {
+			modelIDs = append(modelIDs, m.ModelId)
+		}
+		h.pool.SetModelList(account.ID, modelIDs)
+		return nil
+	}
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
@@ -715,6 +807,16 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 		account.RefreshToken = latest.RefreshToken
 		account.ExpiresAt = latest.ExpiresAt
 		account.ProfileArn = latest.ProfileArn
+	}
+	// An explicit refresh should re-run Bedrock discovery, not reuse the cache, and
+	// re-learn which region each model is callable in.
+	if account.IsBedrock() {
+		clearBedrockModelCache(account.ID)
+		clearBedrockRegionRoutes(account.ID)
+		// Prewarm the per-model callable region in the background (opt-in cost: one
+		// tiny invoke per model per candidate region). The response returns as soon
+		// as discovery is cached; the region map fills in shortly after.
+		go func(acc config.Account) { h.prewarmBedrockRegions(&acc) }(*account)
 	}
 	if err := h.fetchAndCacheAccountModels(account); err != nil {
 		w.WriteHeader(500)
@@ -782,18 +884,19 @@ func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {
 	if base.TokenLimits == nil {
 		base.TokenLimits = extra.TokenLimits
 	}
-  if len(base.AdditionalModelRequestFieldsSchema) == 0 &&
-  	len(extra.AdditionalModelRequestFieldsSchema) > 0 {
-  	base.AdditionalModelRequestFieldsSchema =
-  		append(
-  			json.RawMessage(nil),
-  			extra.AdditionalModelRequestFieldsSchema...,
-  		)
-  }
+	if len(base.AdditionalModelRequestFieldsSchema) == 0 &&
+		len(extra.AdditionalModelRequestFieldsSchema) > 0 {
+		base.AdditionalModelRequestFieldsSchema =
+			append(
+				json.RawMessage(nil),
+				extra.AdditionalModelRequestFieldsSchema...,
+			)
+	}
 	base.InputTypes = mergeStringLists(base.InputTypes, extra.InputTypes)
 	return base
 }
 
+// Read reasoning capabilities from the cached model schema.
 func (h *Handler) reasoningCapabilityForModel(
 	modelID string,
 ) ModelReasoningCapability {
@@ -817,9 +920,21 @@ func (h *Handler) reasoningCapabilityForModel(
 		currentID := strings.ToLower(
 			strings.TrimSpace(model.ModelId),
 		)
-		if currentID == normalizedID {
-			return ParseModelReasoningCapability(model)
+		if currentID != normalizedID {
+			continue
 		}
+		capability := ParseModelReasoningCapability(model)
+
+		if diagnostics.Reasoning() &&
+			capability.SchemaParseError != "" {
+			logger.Warnf(
+				"[KiroReasoning] model=%s schema parse failed: %s",
+				modelID,
+				capability.SchemaParseError,
+			)
+		}
+
+		return capability
 	}
 
 	return ModelReasoningCapability{
@@ -877,38 +992,38 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinkingRequested :=
-	resolveClaudeThinkingMode(
-		req.Model,
-		req.Thinking,
-		thinkingCfg.Suffix,
-	)
+		resolveClaudeThinkingMode(
+			req.Model,
+			req.Thinking,
+			thinkingCfg.Suffix,
+		)
 
-  req.Model = actualModel
-  
-  capability := h.reasoningCapabilityForModel(actualModel)
-  
-  additionalFields, nativeRequested, buildErr :=
-  	BuildClaudeAdditionalModelRequestFields(
-  		&req,
-  		capability,
-  	)
-  if buildErr != nil {
-  	h.sendClaudeError(
-  		w,
-  		400,
-  		"invalid_request_error",
-  		buildErr.Error(),
-  	)
-  	return
-  }
-  
-  thinkingRequested = thinkingRequested || nativeRequested
-  
-  useLegacyThinkingPrompt :=
-  	thinkingRequested &&
-  		len(additionalFields) == 0
-  
-  effectiveReq := cloneClaudeRequestForThinking(&req, useLegacyThinkingPrompt,)
+	req.Model = actualModel
+
+	capability := h.reasoningCapabilityForModel(actualModel)
+
+	additionalFields, nativeRequested, buildErr :=
+		BuildClaudeAdditionalModelRequestFields(
+			&req,
+			capability,
+		)
+	if buildErr != nil {
+		h.sendClaudeError(
+			w,
+			400,
+			"invalid_request_error",
+			buildErr.Error(),
+		)
+		return
+	}
+
+	thinkingRequested = thinkingRequested || nativeRequested
+
+	useLegacyThinkingPrompt :=
+		thinkingRequested &&
+			len(additionalFields) == 0
+
+	effectiveReq := cloneClaudeRequestForThinking(&req, useLegacyThinkingPrompt)
 
 	estimatedTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	if estimatedTokens < 1 {
@@ -980,98 +1095,98 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-  requestedModel := req.Model
-  actualModel, legacyOrClientThinking :=
-  	resolveClaudeThinkingMode(
-  		req.Model,
-  		req.Thinking,
-  		thinkingCfg.Suffix,
-  	)
-  
-  req.Model = actualModel
-  
-  capability := h.reasoningCapabilityForModel(actualModel)
-  
-  additionalFields, nativeRequested, buildErr :=
-  	BuildClaudeAdditionalModelRequestFields(
-  		&req,
-  		capability,
-  	)
-  if buildErr != nil {
-  	h.sendClaudeError(
-  		w,
-  		400,
-  		"invalid_request_error",
-  		buildErr.Error(),
-  	)
-  	return
-  }
-  
-  thinking := legacyOrClientThinking || nativeRequested
-  
-  if diagnostics.Reasoning() {
-  	logger.Infof(
-  		"[ClaudeThinking] requested=%t type=%q budgetTokens=%d effort=%q requestedModel=%q actualModel=%q",
-  		thinking,
-  		claudeThinkingType(&req),
-  		claudeThinkingBudget(&req),
-  		claudeReasoningEffort(&req),
-  		requestedModel,
-  		actualModel,
-  	)
-    logger.Infof(
-  		"[KiroReasoning] model=%s requested=%t schemaPath=%s supportsThinking=%t thinkingTypes=%v supportedEfforts=%v fields=%s",
-  		actualModel,
-  		nativeRequested,
-  		capability.EffortPath,
-  		capability.SupportsThinking,
-  		capability.ThinkingTypes,
-  		capability.Efforts,
-  		reasoningFieldsJSON(additionalFields),
-  	)
-  }
-  
-  useLegacyThinkingPrompt :=
-  	thinking && len(additionalFields) == 0
-  
-  effectiveReq := cloneClaudeRequestForThinking(
-  	&req,
-  	useLegacyThinkingPrompt,
-  )
-  
-  thinkingResponseOpts :=
-  	resolveClaudeThinkingResponseOptions(
-  		req.Thinking,
-  		thinkingCfg.ClaudeFormat,
-  	)
-  
-  estimatedInputTokens :=
-  	estimateClaudeRequestInputTokens(effectiveReq)
-  
-  cacheProfile := h.promptCache.BuildClaudeProfile(
-  	effectiveReq,
-  	estimatedInputTokens,
-  )
-  
-  kiroPayload := ClaudeToKiro(
-  	&req,
-  	useLegacyThinkingPrompt,
-  )
-  
-  kiroPayload.AdditionalModelRequestFields =
-  	additionalFields
+	requestedModel := req.Model
+	actualModel, legacyOrClientThinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+
+	req.Model = actualModel
+
+	capability := h.reasoningCapabilityForModel(actualModel)
+
+	// Build only reasoning fields supported by this model.
+	additionalFields, nativeRequested, buildErr :=
+		BuildClaudeAdditionalModelRequestFields(
+			&req,
+			capability,
+		)
+	if buildErr != nil {
+		h.sendClaudeError(
+			w,
+			400,
+			"invalid_request_error",
+			buildErr.Error(),
+		)
+		return
+	}
+
+	thinking := legacyOrClientThinking || nativeRequested
+
+	if diagnostics.Reasoning() {
+		logger.Infof(
+			"[ClaudeThinking] requested=%t type=%q budgetTokens=%d effort=%q requestedModel=%q actualModel=%q",
+			thinking,
+			claudeThinkingType(&req),
+			claudeThinkingBudget(&req),
+			claudeReasoningEffort(&req),
+			requestedModel,
+			actualModel,
+		)
+		logger.Infof(
+			"[KiroReasoning] model=%s requested=%t schemaPath=%s supportsThinking=%t thinkingTypes=%v thinkingDisplays=%v supportedEfforts=%v fields=%s",
+			actualModel,
+			nativeRequested,
+			capability.EffortPath,
+			capability.SupportsThinking,
+			capability.ThinkingTypes,
+			capability.ThinkingDisplays,
+			capability.Efforts,
+			reasoningFieldsJSON(additionalFields),
+		)
+	}
+
+	useLegacyThinkingPrompt :=
+		thinking && len(additionalFields) == 0
+
+	effectiveReq := cloneClaudeRequestForThinking(
+		&req,
+		useLegacyThinkingPrompt,
+	)
+
+	thinkingResponseOpts :=
+		resolveClaudeThinkingResponseOptions(
+			req.Thinking,
+			thinkingCfg.ClaudeFormat,
+		)
+
+	estimatedInputTokens :=
+		estimateClaudeRequestInputTokens(effectiveReq)
+
+	cacheProfile := h.promptCache.BuildClaudeProfile(
+		effectiveReq,
+		estimatedInputTokens,
+	)
+
+	kiroPayload := ClaudeToKiro(
+		&req,
+		useLegacyThinkingPrompt,
+	)
+
+	kiroPayload.AdditionalModelRequestFields =
+		additionalFields
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	// forwarded marks a request that already passed through one Kiro-Go pool, so a
+	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
+	forwarded := r.Header.Get(forwardHeader) != ""
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body, forwarded)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body, forwarded)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1123,6 +1238,50 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
+		}
+		// Custom API accounts are transparent proxies to another Kiro-Go pool: forward
+		// the raw request instead of translating to Kiro. A successful forward ends the
+		// request; any pre-reply failure falls over to the next account like a Kiro error.
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
+			if forwarded {
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
+		}
+		// Native Bedrock accounts call the Bedrock Runtime invoke endpoint directly
+		// and re-emit the native Anthropic events. Like custom_api this is a
+		// transparent passthrough that ends the request on success; a pre-stream
+		// failure falls over to the next account.
+		if account.IsBedrock() {
+			if bErr := h.invokeBedrockStream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				// A throttle-cooldown skip is advisory (per-model, short); don't
+				// escalate it into an account-wide failure/cooldown.
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
+				continue
+			}
+			return
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 		messageStartUsage = cacheUsage
@@ -1496,20 +1655,20 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if len(toolUses) > 0 {
 			stopReason = "tool_use"
 		}
-    
-    if diagnostics.Stream() {
-    	logger.Infof(
-    		"[ClaudeStream] completed model=%s account=%s stopReason=%s toolUses=%d outputChars=%d inputTokens=%d outputTokens=%d durationMs=%d",
-    		model,
-    		account.Email,
-    		stopReason,
-    		len(toolUses),
-    		len([]rune(outputContent)),
-    		inputTokens,
-    		outputTokens,
-    		time.Since(reqStart).Milliseconds(),
-    	)
-    }
+
+		if diagnostics.Stream() {
+			logger.Infof(
+				"[ClaudeStream] completed model=%s account=%s stopReason=%s toolUses=%d outputChars=%d inputTokens=%d outputTokens=%d durationMs=%d",
+				model,
+				account.Email,
+				stopReason,
+				len(toolUses),
+				len([]rune(outputContent)),
+				inputTokens,
+				outputTokens,
+				time.Since(reqStart).Milliseconds(),
+			)
+		}
 
 		ensureMessageStart()
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -1694,7 +1853,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1709,6 +1868,43 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
+		}
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
+			if forwarded {
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
+		}
+		// Native Bedrock non-streaming invoke (see streaming counterpart above).
+		if account.IsBedrock() {
+			if bErr := h.invokeBedrockNonStream(w, forwardParams{
+				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
+				continue
+			}
+			return
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
@@ -1860,54 +2056,57 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 
-  actualModel, suffixThinking :=
-  	ParseModelAndThinking(
-  		req.Model,
-  		thinkingCfg.Suffix,
-  	)
-  
-  req.Model = actualModel
-  
-  capability := h.reasoningCapabilityForModel(actualModel)
-  
-  additionalFields, nativeRequested, buildErr :=
-  	BuildOpenAIAdditionalModelRequestFields(
-  		&req,
-  		capability,
-  	)
-  if buildErr != nil {
-  	h.sendOpenAIError(
-  		w,
-  		400,
-  		"invalid_request_error",
-  		buildErr.Error(),
-  	)
-  	return
-  }
-  
-  thinking := suffixThinking || nativeRequested
-  
-  useLegacyThinkingPrompt := thinking && len(additionalFields) == 0
-  
-  estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
-  
-  kiroPayload := OpenAIToKiro(
-  	&req,
-  	useLegacyThinkingPrompt,
-  )
-  
-  kiroPayload.AdditionalModelRequestFields = additionalFields
+	actualModel, suffixThinking :=
+		ParseModelAndThinking(
+			req.Model,
+			thinkingCfg.Suffix,
+		)
+
+	req.Model = actualModel
+
+	capability := h.reasoningCapabilityForModel(actualModel)
+
+	additionalFields, nativeRequested, buildErr :=
+		BuildOpenAIAdditionalModelRequestFields(
+			&req,
+			capability,
+		)
+	if buildErr != nil {
+		h.sendOpenAIError(
+			w,
+			400,
+			"invalid_request_error",
+			buildErr.Error(),
+		)
+		return
+	}
+
+	thinking := suffixThinking || nativeRequested
+
+	useLegacyThinkingPrompt := thinking && len(additionalFields) == 0
+
+	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
+
+	kiroPayload := OpenAIToKiro(
+		&req,
+		useLegacyThinkingPrompt,
+	)
+
+	kiroPayload.AdditionalModelRequestFields = additionalFields
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	// forwarded marks a request that already passed through one Kiro-Go pool, so a
+	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
+	forwarded := r.Header.Get(forwardHeader) != ""
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, body, forwarded)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, body, forwarded)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1936,6 +2135,47 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
+		}
+
+		// Native Bedrock accounts serve the OpenAI wire format by converting the
+		// request to Anthropic Messages, invoking Bedrock, and converting the
+		// Anthropic SSE back to OpenAI chunks. Same passthrough/failover contract
+		// as custom_api: success ends the request; a pre-stream error fails over.
+		if account.IsBedrock() {
+			if bErr := h.invokeBedrockOpenAIStream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
+				continue
+			}
+			return
+		}
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
+			if forwarded {
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: true,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
 		}
 
 		var toolCalls []ToolCall
@@ -2318,7 +2558,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2333,6 +2573,46 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
+		}
+
+		// Native Bedrock accounts serve OpenAI by converting to Anthropic, invoking
+		// Bedrock, and converting the Anthropic JSON response back to an OpenAI
+		// chat.completion. Success ends the request; a pre-reply error fails over.
+		if account.IsBedrock() {
+			if bErr := h.invokeBedrockOpenAINonStream(w, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); bErr != nil {
+				lastErr = bErr
+				excluded[account.ID] = true
+				if !errors.Is(bErr, errBedrockThrottled) {
+					h.handleAccountFailure(account, bErr)
+				}
+				continue
+			}
+			return
+		}
+		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		if account.IsCustomApi() {
+			// Already forwarded once: don't add another hop, and don't penalize this
+			// healthy account (loop-guard is not a failure) — just skip it. The account
+			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
+			// real retry on an ineligible account.
+			if forwarded {
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
+				account: account, body: rawBody, endpoint: "openai", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
 		}
 
 		var content string
@@ -2415,6 +2695,16 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
+	// Custom API accounts carry a static upstream bearer (KiroApiKey); there is no
+	// OAuth token to refresh and no expiry to honor.
+	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
+		return nil
+	}
+	// Bedrock accounts authenticate each request with a static IAM access key via
+	// SigV4; there is no OAuth token to refresh and no expiry to honor.
+	if account.IsBedrock() {
+		return nil
+	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
@@ -2672,9 +2962,6 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	if account.ID == "" {
 		account.ID = auth.GenerateAccountID()
 	}
-	if account.Region == "" {
-		account.Region = "us-east-1"
-	}
 
 	// Kiro API-key accounts: the key IS the credential. Validate it, normalize the
 	// auth method, and mirror it into AccessToken so pool routing / model refresh
@@ -2699,6 +2986,36 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		account.AuthMethod = "api_key"
 		account.ExpiresAt = 0
 		account.AccessToken = account.KiroApiKey
+		// Discover the region the key actually serves. The panel deliberately omits
+		// region for api_key adds, so without this an EU-provisioned key would inherit
+		// the us-east-1 default below and 403 on every upstream call, permanently.
+		// A transient upstream failure must not be reported as a bad key, so it maps
+		// to 502 (retry) rather than 400 (caller error).
+		region, info, retryable, err := resolveApiKeyRegion(account.KiroApiKey, account.Region)
+		if err != nil {
+			status := 400
+			if retryable {
+				status = 502
+			}
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		account.Region = region
+		// The probe already paid for the identity round-trip; keep it so the account
+		// shows a real email in the panel and can be deduplicated by UserId later.
+		if info != nil {
+			if account.Email == "" {
+				account.Email = info.Email
+			}
+			if account.UserId == "" {
+				account.UserId = info.UserId
+			}
+		}
+	}
+
+	if account.Region == "" {
+		account.Region = "us-east-1"
 	}
 
 	if err := config.AddAccount(account); err != nil {
@@ -2768,6 +3085,57 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
+	}
+	// Editable Bedrock fields — only for bedrock accounts. Region and credentials
+	// change which upstream/model set the account resolves, so clear the cached model
+	// discovery when any of them move. (Region is deliberately NOT editable for Kiro
+	// accounts here: their Region drives OIDC endpoints and must not be changed by a
+	// generic field update.)
+	if existing.IsBedrock() {
+		bedrockChanged := false
+		if v, ok := updates["region"].(string); ok && strings.TrimSpace(v) != existing.Region {
+			existing.Region = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockApiKey"].(string); ok {
+			existing.BedrockAPIKey = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockAccessKeyId"].(string); ok {
+			existing.BedrockAccessKeyID = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockSecretAccessKey"].(string); ok {
+			existing.BedrockSecretAccessKey = strings.TrimSpace(v)
+			bedrockChanged = true
+		}
+		if v, ok := updates["bedrockUseConverse"].(bool); ok {
+			existing.BedrockUseConverse = v
+		}
+		// bedrockRegions is a JSON array of extra candidate regions; accept string
+		// items and drop blanks.
+		if v, ok := updates["bedrockRegions"].([]interface{}); ok {
+			var regions []string
+			for _, item := range v {
+				if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+					regions = append(regions, strings.TrimSpace(s))
+				}
+			}
+			existing.BedrockRegions = regions
+			bedrockChanged = true
+		}
+		// Guard the same either/or invariant the add endpoint enforces: an update must
+		// not leave the account with no usable credential (it would then fail every
+		// request pre-stream and be perpetually excluded).
+		if existing.BedrockAPIKey == "" && (existing.BedrockAccessKeyID == "" || existing.BedrockSecretAccessKey == "") {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "bedrock account needs either an API key or an access key + secret"})
+			return
+		}
+		if bedrockChanged {
+			clearBedrockModelCache(existing.ID)
+			clearBedrockRegionRoutes(existing.ID)
+		}
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
@@ -3713,8 +4081,33 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
 			return
 		}
-		if req.Region == "" {
-			req.Region = "us-east-1"
+		// Same region trap as apiAddAccount: a region-less record must be probed rather
+		// than defaulted to us-east-1, and an exported region is validated against the
+		// key rather than trusted — api_key accounts never re-probe, so a stale or
+		// mistyped region would restore as a permanently-403ing pool slot.
+		region, info, retryable, err := resolveApiKeyRegion(req.KiroApiKey, req.Region)
+		if err != nil {
+			status := 400
+			if retryable {
+				status = 502
+			}
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		req.Region = region
+		// Prefer the identity supplied by the caller (a full account record), falling
+		// back to what the probe just fetched. UserId matters beyond display: it is how
+		// findAccountForKiroIdentity recognizes two keys minted by the same Kiro
+		// account, so an imported slot without it gets duplicated by a later supply-side
+		// add (double routing weight, double-counted quota) until a refresh backfills it.
+		if info != nil {
+			if req.Email == "" {
+				req.Email = info.Email
+			}
+			if req.UserID == "" {
+				req.UserID = info.UserId
+			}
 		}
 		id := req.ID
 		if id == "" || config.AccountIDExists(id) {
@@ -3723,6 +4116,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		account := config.Account{
 			ID:          id,
 			Email:       req.Email,
+			UserId:      req.UserID,
 			KiroApiKey:  req.KiroApiKey,
 			AccessToken: req.KiroApiKey, // mirror for pool compatibility (see apiAddAccount)
 			AuthMethod:  "api_key",
@@ -4112,6 +4506,42 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 
+	// Custom API accounts have no Kiro credential to exercise; test them by sending a
+	// real minimal chat request THROUGH the linked upstream pool and returning its reply.
+	if account.IsBedrock() {
+		var tReq struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&tReq)
+		// An explicit test must reflect LIVE state, not a cached verdict: drop the
+		// learned region routes so the test re-sweeps every candidate region. Bedrock
+		// per-region access can flap, so a stale "not callable anywhere" negative-cache
+		// entry would otherwise mask a region whose access just reopened.
+		clearBedrockRegionRoutes(account.ID)
+		reply, err := h.bedrockTestReply(account, tReq.Model)
+		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "reply": reply})
+		return
+	}
+	if account.IsCustomApi() {
+		var tReq struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&tReq)
+		reply, err := customApiTestReply(account.BaseURL, account.KiroApiKey, tReq.Model)
+		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "reply": reply})
+		return
+	}
+
 	if err := h.ensureValidToken(account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
@@ -4177,6 +4607,31 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 	if account == nil {
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+
+	// Custom API accounts have no Kiro token/usage to refresh. "Refresh" for them means
+	// re-validating the upstream key against its /api/me quota and reloading the model
+	// list from the upstream /v1/models — never a Kiro/AWS call.
+	if account.IsBedrock() {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Bedrock account; nothing to refresh"})
+		return
+	}
+	if account.IsCustomApi() {
+		quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
+		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		info := quota.toAccountInfo(time.Now().Unix())
+		if updateErr := config.UpdateAccountInfo(id, info); updateErr != nil {
+			logger.Warnf("[Refresh] custom_api quota persist failed for %s: %v", account.ID, updateErr)
+		}
+		if err := h.fetchAndCacheAccountModels(account); err != nil {
+			logger.Warnf("[Refresh] custom_api model reload failed for %s: %v", account.ID, err)
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "info": info})
 		return
 	}
 
@@ -4361,6 +4816,55 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
+	// Custom API accounts serve whatever the linked pool serves: load the model list
+	// from the upstream provider's /v1/models, not from Kiro/AWS.
+	if account.IsBedrock() {
+		// Prefer live-discovered callable models (access agreement AVAILABLE); fall
+		// back to the account/default static map when discovery is unavailable (e.g.
+		// the key lacks bedrock:ListFoundationModels).
+		ids := h.cachedOrDiscoverBedrockModels(account)
+		if len(ids) == 0 {
+			for _, v := range account.BedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		if len(ids) == 0 {
+			for _, v := range defaultBedrockModelMap {
+				ids = append(ids, v)
+			}
+		}
+		// The panel expects {success, models:[{modelId}]} (same shape as custom_api),
+		// not a bare string array. Annotate each model with its learned callable
+		// region (from lazy routing / prewarm) when known, so the UI can show where a
+		// model actually works. "region": "" means not yet probed.
+		models := make([]map[string]interface{}, 0, len(ids))
+		for _, mid := range ids {
+			region := ""
+			if r, ok := getBedrockRoute(account.ID, mid); ok && r.callable {
+				region = r.region
+			}
+			models = append(models, map[string]interface{}{"modelId": mid, "region": region})
+		}
+		h.pool.SetModelList(account.ID, ids)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models, "candidateRegions": candidateRegions(account)})
+		return
+	}
+	if account.IsCustomApi() {
+		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
+		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		modelIDs := make([]string, 0, len(models))
+		for _, m := range models {
+			modelIDs = append(modelIDs, m.ModelId)
+		}
+		h.pool.SetModelList(id, modelIDs)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models})
+		return
+	}
+
 	models, err := ListAvailableModels(account)
 	if err != nil {
 		w.WriteHeader(500)
@@ -4496,17 +5000,36 @@ func applyProxyConfig(proxyURL string) {
 	auth.InitHttpClient(proxyURL)
 }
 
-// apiGetProxy 获取当前代理配置
+// apiGetProxy 获取当前代理配置 (single proxy + rotation pool + active proxy)
 func (h *Handler) apiGetProxy(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{
-		"proxyURL": config.GetProxyURL(),
+	active := config.GetProxyURL()
+	if h.proxyRotator != nil {
+		active = h.proxyRotator.activeURL()
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"proxyURL":           config.GetProxyURL(),
+		"proxyURLs":          config.GetProxyURLs(),
+		"proxyRotateMinutes": config.GetProxyRotateMinutes(),
+		"activeProxyURL":     active,
 	})
 }
 
-// apiUpdateProxy 更新代理配置并立即生效
+// isValidProxyScheme reports whether a proxy URL starts with a supported scheme.
+func isValidProxyScheme(u string) bool {
+	return strings.HasPrefix(u, "http://") ||
+		strings.HasPrefix(u, "https://") ||
+		strings.HasPrefix(u, "socks5://") ||
+		strings.HasPrefix(u, "socks5h://")
+}
+
+// apiUpdateProxy 更新代理配置并立即生效. Accepts a single proxyURL plus an optional
+// rotation pool (proxyURLs) and interval (proxyRotateMinutes). When the pool is
+// non-empty the rotator cycles it; otherwise the single proxyURL is applied.
 func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ProxyURL string `json:"proxyURL"`
+		ProxyURL           string   `json:"proxyURL"`
+		ProxyURLs          []string `json:"proxyURLs"`
+		ProxyRotateMinutes int      `json:"proxyRotateMinutes"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4515,25 +5038,43 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 验证代理 URL 格式（非空时）
-	if req.ProxyURL != "" {
-		if !strings.HasPrefix(req.ProxyURL, "http://") &&
-			!strings.HasPrefix(req.ProxyURL, "https://") &&
-			!strings.HasPrefix(req.ProxyURL, "socks5://") &&
-			!strings.HasPrefix(req.ProxyURL, "socks5h://") {
+	if req.ProxyURL != "" && !isValidProxyScheme(req.ProxyURL) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+		return
+	}
+	// Validate and clean every pool entry.
+	cleaned := make([]string, 0, len(req.ProxyURLs))
+	for _, u := range req.ProxyURLs {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		if !isValidProxyScheme(u) {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "each proxy must start with http://, https://, socks5://, or socks5h://: " + u})
 			return
 		}
+		cleaned = append(cleaned, u)
+	}
+	if req.ProxyRotateMinutes < 0 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "proxyRotateMinutes must be >= 0"})
+		return
 	}
 
-	if err := config.UpdateProxySettings(req.ProxyURL); err != nil {
+	if err := config.UpdateProxySettings(req.ProxyURL, cleaned, req.ProxyRotateMinutes); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	// 立即应用新的代理配置
-	applyProxyConfig(req.ProxyURL)
+	// 立即应用新的代理配置 (also (re)starts or stops rotation).
+	if h.proxyRotator != nil {
+		h.proxyRotator.configure(req.ProxyURL, cleaned, config.GetProxyRotateMinutes())
+	} else {
+		applyProxyConfig(req.ProxyURL)
+	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }

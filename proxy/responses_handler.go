@@ -95,8 +95,8 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		Messages:     finalMessages,
 		Stream:       req.Stream,
 		Tools:        req.Tools,
-    Thinking:     req.Thinking,
-	  OutputConfig: req.OutputConfig,
+		Thinking:     req.Thinking,
+		OutputConfig: req.OutputConfig,
 	}
 	if req.Temperature != nil {
 		openaiReq.Temperature = *req.Temperature
@@ -104,63 +104,68 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	if req.MaxOutputTokens != nil {
 		openaiReq.MaxTokens = *req.MaxOutputTokens
 	}
-  if req.Reasoning != nil {
-  	openaiReq.Reasoning = &OpenAIReasoningConfig{
-  		Effort: req.Reasoning.Effort,
-  	}
-  }
+	if req.Reasoning != nil {
+		openaiReq.Reasoning = &OpenAIReasoningConfig{
+			Effort: req.Reasoning.Effort,
+		}
+	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, suffixThinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix,)
+	actualModel, suffixThinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 
-  openaiReq.Model = actualModel
-  
-  capability := h.reasoningCapabilityForModel(actualModel)
-  
-  additionalFields, nativeRequested, buildErr :=
-  	BuildOpenAIAdditionalModelRequestFields(
-  		openaiReq,
-  		capability,
-  	)
-  if buildErr != nil {
-  	h.sendOpenAIError(
-  		w,
-  		400,
-  		"invalid_request_error",
-  		buildErr.Error(),
-  	)
-  	return
-  }
-  
-  thinking := suffixThinking || nativeRequested
-  
-  useLegacyThinkingPrompt :=
-  	thinking && len(additionalFields) == 0
-  
-  estimatedInputTokens :=
-  	estimateOpenAIRequestInputTokens(openaiReq)
-  
-  kiroPayload := OpenAIToKiro(openaiReq, useLegacyThinkingPrompt,)
-  
-  kiroPayload.AdditionalModelRequestFields = additionalFields
+	openaiReq.Model = actualModel
+
+	capability := h.reasoningCapabilityForModel(actualModel)
+
+	// Map Responses reasoning to the model's native schema.
+	additionalFields, nativeRequested, buildErr :=
+		BuildOpenAIAdditionalModelRequestFields(
+			openaiReq,
+			capability,
+		)
+	if buildErr != nil {
+		h.sendOpenAIError(
+			w,
+			400,
+			"invalid_request_error",
+			buildErr.Error(),
+		)
+		return
+	}
+
+	thinking := suffixThinking || nativeRequested
+
+	useLegacyThinkingPrompt :=
+		thinking && len(additionalFields) == 0
+
+	estimatedInputTokens :=
+		estimateOpenAIRequestInputTokens(openaiReq)
+
+	kiroPayload := OpenAIToKiro(openaiReq, useLegacyThinkingPrompt)
+
+	kiroPayload.AdditionalModelRequestFields = additionalFields
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
+	// forwarded marks a request that already passed through one Kiro-Go pool, so a
+	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
+	forwarded := r.Header.Get(forwardHeader) != ""
 
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, respID, &req, storedInputCopy, storeResponse)
+			apiKeyID, respID, &req, storedInputCopy, storeResponse, body, forwarded)
 		return
 	}
 
 	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, respID, &req, storedInputCopy, storeResponse)
+		apiKeyID, respID, &req, storedInputCopy, storeResponse, body, forwarded)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	rawBody []byte, forwarded bool,
 ) {
 	excluded := make(map[string]bool)
 	var lastErr error
@@ -171,11 +176,33 @@ func (h *Handler) handleResponsesNonStream(
 		if account == nil {
 			break
 		}
+		// Custom API accounts already forwarded once must not add another hop. Excluded
+		// + attempt-- so an ineligible account is skipped without burning a retry.
+		if forwarded && account.IsCustomApi() {
+			excluded[account.ID] = true
+			attempt--
+			continue
+		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
+		}
+		// Custom API accounts are transparent proxies to another Kiro-Go pool: forward
+		// the raw /v1/responses request instead of translating to Kiro. Success ends the
+		// request; a pre-reply failure falls over to the next account.
+		if account.IsCustomApi() {
+			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
+				account: account, body: rawBody, endpoint: "responses", streaming: false,
+				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+			}); fwdErr != nil {
+				lastErr = fwdErr
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, fwdErr)
+				continue
+			}
+			return
 		}
 
 		var content, reasoningContent string
@@ -309,7 +336,10 @@ func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	rawBody []byte, forwarded bool,
 ) {
+	_ = rawBody // streaming /v1/responses does not forward to custom_api upstreams (see loop below)
+	_ = forwarded
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -355,6 +385,17 @@ func (h *Handler) handleResponsesStream(
 		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
 		if account == nil {
 			break
+		}
+		// Custom API accounts cannot serve the STREAMING /v1/responses path: this
+		// handler has already emitted response.created, so a transparent forward would
+		// double-emit the upstream's own lifecycle events. Skip them (no ban, no
+		// translation against their non-Kiro key) and fail over to a Kiro account.
+		// Non-streaming /v1/responses forwards these accounts normally. Excluded +
+		// attempt-- so skipping an ineligible account does not burn a retry attempt.
+		if account.IsCustomApi() {
+			excluded[account.ID] = true
+			attempt--
+			continue
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
